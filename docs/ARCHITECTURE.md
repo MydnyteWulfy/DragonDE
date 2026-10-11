@@ -20,7 +20,7 @@ Language: C++23 · Build: CMake · Target: Arch Linux, Intel Arc (xe/Mesa) first
 **Non-goals (for now)**
 - X11 window manager mode (XWayland is supported; native X11 sessions are not).
 - Non-Linux platforms.
-- Multi-GPU / hybrid graphics. The design leaves room for it, but it's not v1.
+- Multi-GPU / hybrid graphics.
 
 ### Is "KDE-style, no wlroots" viable?
 
@@ -31,7 +31,7 @@ move in 2024 (Aquamarine plus a C++ protocol scanner). The costs we accept:
 | We own                         | Why it's hard                                         |
 |--------------------------------|-------------------------------------------------------|
 | KMS atomic modesetting         | Plane assignment, test-commits, hotplug, VRR, page-flip timing |
-| Buffer import (shm + dmabuf)   | Format/modifier negotiation, EGLImage, explicit sync  |
+| Buffer import (shm + dmabuf)   | Format/modifier negotiation, Vulkan import, explicit sync |
 | Session/seat (libseat)         | VT switching, device revoke, suspend/resume           |
 | Protocol plumbing              | Dozens of protocols, each with edge cases clients rely on |
 | XWayland window manager        | A full XWM over xcb (focus, stacking, ICCCM/EWMH)     |
@@ -90,7 +90,7 @@ matches Plasma (KWin plus plasmashell).
 ├─────────────────────────────────────────────────────────────────────┤
 │ Scene         Node tree · per-output damage · hit testing           │
 ├─────────────────────────────────────────────────────────────────────┤
-│ Render        GLES 3.2 via EGL (Vulkan later) · texture import      │
+│ Render        Vulkan 1.3 · dmabuf import · GBM-backed targets        │
 ├─────────────────────────────────────────────────────────────────────┤
 │ Backend       IBackend → Nested(Wayland) | DRM | Headless           │
 │               outputs · input devices · allocator · present timing  │
@@ -142,15 +142,39 @@ DRM details planned up front:
 - Page-flip driven frame scheduling: render as late as possible before vblank.
 - VRR (`VRR_ENABLED`) and tearing (`wp_tearing_control_v1`) for games.
 
-### 3.3 Renderer
-- **GLES 3.2 on EGL** first (best-trodden path on Mesa/xe). An `IRenderer`
-  interface leaves room for a Vulkan backend later.
-- Buffer import:
-  - `wl_shm` → upload to GL texture (track damage, upload only damaged rects).
-  - `linux-dmabuf-v1` → `EGLImage` → texture, zero-copy. Advertise format and
-    modifier tables from `EGL_EXT_image_dma_buf_import_modifiers`, with
-    feedback (v4+) so clients pick scanout-capable modifiers.
-- Explicit sync: `linux-drm-syncobj-v1`.
+### 3.3 Renderer (Vulkan)
+- **Vulkan 1.3 from the start** (decided). Mesa's ANV driver on the Arc B580
+  supports everything below. We use dynamic rendering and synchronization2,
+  so no render-pass objects and no `VkFramebuffer` boilerplate.
+- **One buffer path for every backend.** We never use a `VkSwapchainKHR`.
+  Render targets are GBM buffer objects imported into Vulkan as dmabufs
+  (`VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier`):
+  - DRM backend: the same dmabuf becomes a KMS framebuffer and is scanned out.
+  - Nested backend: the dmabuf is handed to the parent compositor (KDE)
+    through *its* `linux-dmabuf-v1`, attached to our window's surface.
+  - Headless: the dmabuf is read back for tests and screenshots.
+  So the nested dev loop exercises exactly the code the real hardware runs.
+- Client buffer import:
+  - `wl_shm` → staging buffer → `VkImage` copy (only damaged rects).
+  - `linux-dmabuf-v1` → `VkImage` bound to imported memory, zero-copy.
+    Format/modifier tables come from `vkGetPhysicalDeviceFormatProperties2`
+    with `VkDrmFormatModifierPropertiesListEXT`; feedback (v4+) tells clients
+    which modifiers can be scanned out.
+- **Synchronization** is the hard part with Vulkan, so it's designed up front:
+  - Implicit-sync clients: export the dmabuf's fence with
+    `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` and import it as a semaphore
+    (`VK_KHR_external_semaphore_fd`, `SYNC_FD`) before sampling.
+  - Explicit-sync clients: `linux-drm-syncobj-v1` timeline points imported
+    the same way.
+  - Our output: export a sync_file from the render's completion and give it to
+    KMS as `IN_FENCE_FD`, or attach it to the dmabuf for the parent compositor.
+  - Queue family ownership transfers use `VK_QUEUE_FAMILY_FOREIGN_EXT` for
+    every imported/exported image.
+- Shaders: GLSL compiled to SPIR-V at build time with `glslc`, then embedded
+  in the binary. A handful of pipelines: textured quad (with per-format variants),
+  solid rect, and later blur/shadow.
+- Validation layers are on in debug builds. Every Vulkan object is named via
+  `VK_EXT_debug_utils` so validation messages are readable.
 - Effects (blur, shadows, rounded corners, animations) are render passes on
   scene nodes. They are designed for but not built until after M4.
 
@@ -159,7 +183,7 @@ DRM details planned up front:
   `TextureNode` (decorations/effects).
 - Layers from bottom to top: `background · bottom · windows · top · overlay ·
   lock`, matching layer-shell and session-lock.
-- Per-output damage accumulation with buffer age (`EGL_EXT_buffer_age`), so
+- Per-output damage accumulation with buffer age (we own the target ring, so age is known), so
   only changed regions are repainted.
 - Hit-testing for input uses the same tree, so what you see is what you click.
 
@@ -231,12 +255,11 @@ DRM details planned up front:
 
 ## 4. Shell and desktop components
 
-**Toolkit decision: Qt 6 / Qt Quick** (recommended; open decision, see §7).
+**Toolkit: Qt 6 / Qt Quick** (decided).
 - It's what Plasma uses, it's C++, and it's already installed (6.11). Needs
   `qt6-wayland` and `layer-shell-qt` added.
-- Alternative: a custom toolkit on our own renderer. That's more "from
-  scratch" but adds months of text, layout, and accessibility work before the
-  first panel exists.
+- Qt Quick picks its own graphics backend; it can run on Vulkan too, but it
+  doesn't need to match the compositor.
 
 | Component      | Protocols/APIs |
 |----------------|----------------|
@@ -264,7 +287,7 @@ DragonDE/
 ├── compositor/
 │   ├── core/                  # event loop, signals, logging
 │   ├── backend/{nested,drm,headless}/
-│   ├── render/gles/
+│   ├── render/vulkan/  # + shaders/ (GLSL → SPIR-V)
 │   ├── scene/
 │   ├── protocols/             # handwritten logic per protocol
 │   ├── wm/                    # windows, workspaces, focus, decorations
@@ -286,7 +309,7 @@ DragonDE/
 
 | # | Milestone | Done when |
 |---|-----------|-----------|
-| **M0** | Skeleton | CMake builds; `dragon-scanner` generates bindings; core loop; nested backend opens a window and clears it to a color; headless backend renders offscreen. |
+| **M0** | Skeleton | CMake builds; `dragon-scanner` generates bindings; core loop; Vulkan device + GBM-backed render targets with validation clean; nested backend opens a window and shows a Vulkan-cleared dmabuf; headless backend renders offscreen. |
 | **M1** | First pixels from clients | Tier 0 protocols. `foot` runs inside the nested compositor via `wl_shm`. Keyboard/pointer focus, move, close, Super+Enter to spawn terminal. |
 | **M2** | Real apps | Tier 1 + 1g. dmabuf zero-copy; damage tracking; SSD; fractional scale; multiple nested outputs. Qt, GTK4, Firefox, mpv, and a LunarEngine build all run correctly. |
 | **M3** | Bare metal | DRM backend with libseat; launch from TTY; VT switching; hotplug; cursor plane; frame scheduling; VRR. SDDM session entry. |
@@ -306,25 +329,34 @@ Testing throughout:
 
 ## 7. Open decisions
 
+**Decided (2026-10-11)**
+
+| Decision | Choice |
+|----------|--------|
+| Shell toolkit | Qt 6 / Qt Quick |
+| Window paradigm | Floating by default, tiling toggled per workspace |
+| Renderer | Vulkan 1.3 from the start (no GLES path) |
+| Scanner | Our own `dragon-scanner` |
+
+**Still open**
+
 | Decision | Recommendation | Alternatives |
 |----------|----------------|--------------|
-| Shell toolkit | Qt 6 / Qt Quick | Custom toolkit on our renderer |
-| Window paradigm | Floating + per-workspace tiling | Floating only · tiling-first (Sway/niri style) |
 | Config format | TOML | Custom DSL · Lua scripting |
-| Renderer | GLES now, Vulkan later | Vulkan from the start (more work, B580 handles it well) |
-| Scanner | Write our own | Adopt hyprwayland-scanner (BSD-3) |
 | Dependency policy | System packages via pkg-config | Vendored submodules / CPM |
 
 ## 8. Dependencies
 
 Installed: `wayland 1.26`, `wayland-protocols 1.49`, `libinput`, `libxkbcommon`,
 `pixman`, `mesa`, `libdrm`, `seatd`, `libdisplay-info`, `hwdata`, `libxcb`,
-`xorg-xwayland`, `pipewire`, `qt6-base`, `qt6-declarative`, `foot`, `cmake`, GCC 16.
+`xorg-xwayland`, `pipewire`, `qt6-base`, `qt6-declarative`, `foot`, `cmake`, GCC 16,
+`vulkan-icd-loader`, `vulkan-intel`, `vulkan-tools`, `shaderc` (`glslc`),
+`glslang`, `spirv-tools`, `pugixml` (scanner), `gtest`.
 
-To add (when needed): `tomlplusplus`, `sdbus-cpp` (M6), `qt6-wayland` +
-`layer-shell-qt` (M4), `xcb-util-wm` + `xcb-util-errors` (M5), `pugixml` or
-`expat` for the scanner (M0), `catch2` or `gtest` (M0), `weston` (for
-`weston-simple-*` test clients, optional).
+To add: `vulkan-headers` + `vulkan-validation-layers` (M0), `tomlplusplus`
+(M2), `qt6-wayland` + `layer-shell-qt` (M4), `xcb-util-wm` +
+`xcb-util-errors` (M5), `sdbus-cpp` (M6), `weston` (for `weston-simple-*`
+test clients, optional).
 
 ## 9. References worth reading
 - KWin source: `src/backends/drm`, `src/wayland`, `src/scene`. The closest
@@ -333,4 +365,4 @@ To add (when needed): `tomlplusplus`, `sdbus-cpp` (M6), `qt6-wayland` +
   leaving wlroots.
 - Weston: the reference compositor; small, readable protocol implementations.
 - *The Wayland Protocol* book (Drew DeVault) and `wayland.app` protocol explorer.
-- Kernel docs: KMS atomic API, `drm-kms.rst`; Mesa EGL extensions registry.
+- Kernel docs: KMS atomic API, `drm-kms.rst`; Vulkan spec chapters on external memory, DRM format modifiers, and sync_file.
