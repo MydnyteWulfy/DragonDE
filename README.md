@@ -4,10 +4,10 @@ A Wayland desktop environment written from scratch in C++23: own compositor
 (no wlroots), Vulkan renderer, Qt Quick shell. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
-**Status:** M0 complete; M1 in progress (stages 1–4 of 5 done). Apps show up,
-including GPU-rendered ones like kitty (zero-copy dma-buf), and take keyboard
-and mouse input: click to focus, typing, scrolling, copy/paste between apps.
-Window management (moving, keybindings) comes next.
+**Status:** M0 and M1 complete. Inside a nested window, apps such as kitty
+and foot run with GPU rendering (zero-copy dma-buf), keyboard and mouse input,
+click-to-focus, copy/paste, moving, resizing and maximizing. Next up (M2):
+broader app compatibility (cursors, scaling, more protocols).
 
 ## Build
 
@@ -43,11 +43,30 @@ WAYLAND_DISPLAY=wayland-1 ./build/debug/tools/demo-client/dragon-demo-client
 
 Close the window or press Ctrl+C to quit.
 
+### Shortcuts
+
+`Mod` is **Super**, or **Alt** when running nested (the parent compositor
+usually keeps Super shortcuts for itself). Override with `DRAGON_MOD`.
+
+| Shortcut | Action |
+|----------|--------|
+| `Mod+Enter` | Open a terminal (`DRAGON_TERMINAL`, default `kitty`) |
+| `Mod+Q` | Close the focused window |
+| `Mod+Shift+Esc` | Quit DragonDE |
+| `Mod`+left drag | Move a window |
+| `Mod`+right drag | Resize a window from the nearest corner |
+| Click | Focus and raise |
+
+Apps that draw their own title bars (kitty, GTK apps) can also be moved,
+resized and maximized from those.
+
 | Variable | Values | Default |
 |----------|--------|---------|
 | `DRAGON_BACKEND` | `nested`, `headless` | nested if a parent compositor exists, else headless |
 | `DRAGON_LOG` | `trace` `debug` `info` `warn` `error` `off` | `info` |
 | `DRAGON_VK_VALIDATION` | `0`, `1` | on in Debug builds |
+| `DRAGON_MOD` | `super`, `alt`, `ctrl` | `super`; `alt` when nested |
+| `DRAGON_TERMINAL` | any shell command | `kitty` |
 
 ## Layout
 

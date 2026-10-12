@@ -397,9 +397,13 @@ void XdgToplevel::setResizing(bool on) { update(&Configure::resizing, on); }
 void XdgToplevel::sendRoleConfigure(std::uint32_t serial)
 {
     if (!m_sentCapabilities && version() >= 5) {
-        // Nothing yet: clients hide maximize/fullscreen/minimize/menu buttons.
+        // What the desktop handles; clients hide buttons for the rest (minimize, window menu).
         wl_array caps;
         wl_array_init(&caps);
+        for (auto cap : {proto::XdgToplevelWmCapabilities::Maximize, proto::XdgToplevelWmCapabilities::Fullscreen}) {
+            if (auto* p = static_cast<std::uint32_t*>(wl_array_add(&caps, sizeof(std::uint32_t))))
+                *p = std::uint32_t(cap);
+        }
         sendWmCapabilities(&caps);
         wl_array_release(&caps);
         m_sentCapabilities = true;

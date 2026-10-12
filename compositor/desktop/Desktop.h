@@ -28,10 +28,27 @@ public:
     struct Window {
         XdgToplevel* toplevel;
         Point position; // top-left of the window geometry, in global coordinates
+
+        // Interactive resize: edges being dragged (XdgToplevelResizeEdge bits)
+        // and the geometry when it started, so the opposite edges stay put.
+        std::uint32_t resizeEdges = 0;
+        Rect resizeStart;
+        // Geometry to return to when leaving maximized/fullscreen.
+        std::optional<Rect> restore;
+
+        std::vector<Connection> connections;
     };
 
-    // Where new windows get placed.
+    // Where new windows get placed and what maximized windows fill.
     void setArea(Rect area) { m_area = area; }
+    Rect area() const { return m_area; }
+
+    // Global window geometry (position + xdg window geometry size).
+    Rect geometryOf(const Window& window) const;
+    void beginResize(Window& window, std::uint32_t edges);
+    void endResize(Window& window);
+    void setMaximized(Window& window, bool on);
+    void setFullscreen(Window& window, bool on);
 
     // Mapped windows, bottom to top.
     const std::vector<std::unique_ptr<Window>>& windows() const { return m_windows; }
@@ -64,6 +81,9 @@ public:
 
     Signal<Window*> windowMapped;
     Signal<Window*> focusChanged;
+    // The client asked to be moved/resized by the pointer (e.g. dragging its title bar).
+    Signal<Window*, std::uint32_t> moveRequested;                // serial
+    Signal<Window*, std::uint32_t, std::uint32_t> resizeRequested; // serial, edges
     Signal<Window*> windowUnmapped;
 
 private:
@@ -76,6 +96,8 @@ private:
     static XdgToplevel* rootToplevel(const XdgPopup* popup);
     static Surface* rootSurface(Surface* surface); // up through subsurface parents
     static bool hitTree(Surface* surface, Point origin, PointF point, Hit& hit);
+    void committed(Window& window);
+    void setFillState(Window& window, bool on, bool fullscreen);
 
     Server& m_server;
     Window* m_focused = nullptr;

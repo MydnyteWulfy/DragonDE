@@ -2,6 +2,7 @@
 
 #include "Server.h"
 #include "core/Log.h"
+#include "protocols/Compositor.h"
 #include "protocols/Seat.h"
 #include "protocols/XdgShell.h"
 
@@ -35,6 +36,23 @@ void Desktop::trackToplevel(XdgToplevel* toplevel)
     XdgSurface* xdg = toplevel->xdgSurface();
     tracked->connections.push_back(xdg->mapped.connect([this, toplevel] { mapWindow(toplevel); }));
     tracked->connections.push_back(xdg->unmapped.connect([this, toplevel] { unmapWindow(toplevel); }));
+    // Before mapping there's no Window yet: answer in the first configure.
+    tracked->connections.push_back(toplevel->maximizeRequested.connect([this, toplevel](bool on) {
+        if (Window* w = windowFor(toplevel))
+            setMaximized(*w, on);
+        else {
+            toplevel->setMaximized(on);
+            toplevel->setSize(on ? m_area.size() : Size{});
+        }
+    }));
+    tracked->connections.push_back(toplevel->fullscreenRequested.connect([this, toplevel](bool on) {
+        if (Window* w = windowFor(toplevel))
+            setFullscreen(*w, on);
+        else {
+            toplevel->setFullscreen(on);
+            toplevel->setSize(on ? m_area.size() : Size{});
+        }
+    }));
     tracked->connections.push_back(toplevel->destroyed.connect([this, toplevel] {
         unmapWindow(toplevel); // no-op if already unmapped
         m_tracked.erase(toplevel);
@@ -66,9 +84,20 @@ void Desktop::mapWindow(XdgToplevel* toplevel)
               m_area.y + (m_area.height - geometry.height) / 2 + offset};
     pos.x = std::max(pos.x, m_area.x);
     pos.y = std::max(pos.y, m_area.y);
+    const auto& configured = toplevel->pendingConfigure();
+    if (configured.maximized || configured.fullscreen)
+        pos = m_area.position(); // started maximized: fill the area
 
-    m_windows.push_back(std::make_unique<Window>(Window{toplevel, pos}));
+    m_windows.push_back(std::make_unique<Window>(Window{.toplevel = toplevel, .position = pos}));
     Window* window = m_windows.back().get();
+    window->connections.push_back(
+        toplevel->moveRequested.connect([this, window](std::uint32_t serial) { moveRequested.emit(window, serial); }));
+    window->connections.push_back(toplevel->resizeRequested.connect(
+        [this, window](std::uint32_t serial, proto::XdgToplevelResizeEdge edges) {
+            resizeRequested.emit(window, serial, std::uint32_t(edges));
+        }));
+    if (Surface* surface = toplevel->xdgSurface()->surface())
+        window->connections.push_back(surface->committed.connect([this, window] { committed(*window); }));
     log::debug("desktop", "mapped '{}' ({}) {}x{} at {},{}", toplevel->title(), toplevel->appId(), geometry.width,
                geometry.height, pos.x, pos.y);
     windowMapped.emit(window);
@@ -141,6 +170,73 @@ std::vector<Desktop::RenderItem> Desktop::renderList() const
         }
     }
     return items;
+}
+
+Rect Desktop::geometryOf(const Window& window) const
+{
+    const XdgSurface* xdg = window.toplevel->xdgSurface();
+    const Size size = xdg ? xdg->geometry().size() : Size{};
+    return {window.position.x, window.position.y, size.width, size.height};
+}
+
+void Desktop::beginResize(Window& window, std::uint32_t edges)
+{
+    window.resizeEdges = edges;
+    window.resizeStart = geometryOf(window);
+    window.toplevel->setResizing(true);
+}
+
+void Desktop::endResize(Window& window)
+{
+    window.resizeEdges = 0;
+    window.toplevel->setResizing(false);
+}
+
+void Desktop::committed(Window& window)
+{
+    if (!window.resizeEdges)
+        return;
+    // Dragging the left/top edge: the client grew or shrank from the right/
+    // bottom, so move the window to keep the opposite edge where it was.
+    const Rect g = geometryOf(window);
+    const auto edges = window.resizeEdges;
+    if (edges & std::uint32_t(proto::XdgToplevelResizeEdge::Left))
+        window.position.x = window.resizeStart.x + window.resizeStart.width - g.width;
+    if (edges & std::uint32_t(proto::XdgToplevelResizeEdge::Top))
+        window.position.y = window.resizeStart.y + window.resizeStart.height - g.height;
+}
+
+void Desktop::setMaximized(Window& window, bool on)
+{
+    setFillState(window, on, /*fullscreen=*/false);
+}
+
+void Desktop::setFullscreen(Window& window, bool on)
+{
+    setFillState(window, on, /*fullscreen=*/true);
+}
+
+void Desktop::setFillState(Window& window, bool on, bool fullscreen)
+{
+    XdgToplevel* tl = window.toplevel;
+    if (fullscreen)
+        tl->setFullscreen(on);
+    else
+        tl->setMaximized(on);
+
+    const auto& cfg = tl->pendingConfigure();
+    const bool filling = cfg.maximized || cfg.fullscreen;
+    if (filling) {
+        if (!window.restore)
+            window.restore = geometryOf(window);
+        // No panels yet: maximized and fullscreen both fill the whole area.
+        tl->setSize(m_area.size());
+        window.position = m_area.position();
+    } else if (window.restore) {
+        tl->setSize(window.restore->size());
+        window.position = window.restore->position();
+        window.restore.reset();
+    }
 }
 
 void Desktop::focus(Window* window)

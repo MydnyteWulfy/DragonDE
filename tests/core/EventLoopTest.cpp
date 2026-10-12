@@ -83,3 +83,24 @@ TEST_F(LoopFixture, BeforeSleepRunsAfterIdleBeforeBlocking)
 
     EXPECT_EQ(order, (std::vector<int>{1, 2}));
 }
+
+// ------------------------------------------------------------------ spawning --
+
+#include "core/Process.h"
+
+#include <filesystem>
+#include <thread>
+
+TEST(Process, SpawnRunsAShellCommand)
+{
+    const auto marker = std::filesystem::path(::testing::TempDir()) / "dragon-spawn-marker";
+    std::filesystem::remove(marker);
+
+    ASSERT_TRUE(dragon::process::spawn("touch '" + marker.string() + "'"));
+
+    for (int i = 0; i < 200 && !std::filesystem::exists(marker); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    dragon::process::reapChildren();
+    EXPECT_TRUE(std::filesystem::exists(marker));
+    std::filesystem::remove(marker);
+}

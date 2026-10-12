@@ -1,6 +1,7 @@
 add_library(dragon_core STATIC
     core/EventLoop.cpp
     core/Log.cpp
+    core/Process.cpp
 )
 pkg_check_modules(Pixman REQUIRED IMPORTED_TARGET pixman-1)
 

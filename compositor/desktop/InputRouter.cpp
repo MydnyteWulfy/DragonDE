@@ -2,13 +2,27 @@
 
 #include "backend/Backend.h"
 #include "core/Log.h"
-#include "desktop/Desktop.h"
 #include "protocols/Compositor.h"
 #include "protocols/Seat.h"
+#include "protocols/XdgShell.h"
+
+#include <algorithm>
+#include <cmath>
+#include <linux/input-event-codes.h>
 
 namespace dragon {
 
-InputRouter::InputRouter(Backend& backend, Desktop& desktop, Seat& seat) : m_desktop(desktop), m_seat(seat)
+namespace {
+using Edge = proto::XdgToplevelResizeEdge;
+constexpr std::uint32_t kLeft = std::uint32_t(Edge::Left);
+constexpr std::uint32_t kRight = std::uint32_t(Edge::Right);
+constexpr std::uint32_t kTop = std::uint32_t(Edge::Top);
+constexpr std::uint32_t kBottom = std::uint32_t(Edge::Bottom);
+} // namespace
+
+InputRouter::InputRouter(Backend& backend, Desktop& desktop, Seat& seat, WindowManagerConfig config,
+                         WindowManagerActions actions)
+    : m_desktop(desktop), m_seat(seat), m_config(std::move(config)), m_actions(std::move(actions))
 {
     auto& in = backend.input;
     // Single output at the origin for now: output pixels are global coordinates.
@@ -16,35 +30,101 @@ InputRouter::InputRouter(Backend& backend, Desktop& desktop, Seat& seat) : m_des
         [this](Output*, double x, double y, std::uint32_t t) { motion({x, y}, t); }));
     m_connections.push_back(in.pointerButton.connect(
         [this](std::uint32_t b, bool pressed, std::uint32_t t) { button(b, pressed, t); }));
-    m_connections.push_back(in.pointerAxis.connect([this](const PointerAxisEvent& e) { m_seat.notifyAxis(e); }));
-    m_connections.push_back(in.pointerFrame.connect([this] { m_seat.notifyFrame(); }));
+    m_connections.push_back(in.pointerAxis.connect([this](const PointerAxisEvent& e) {
+        if (!grabbing())
+            m_seat.notifyAxis(e);
+    }));
+    m_connections.push_back(in.pointerFrame.connect([this] {
+        if (!grabbing())
+            m_seat.notifyFrame();
+    }));
     m_connections.push_back(in.pointerLeft.connect([this] {
         m_pointerInside = false;
-        if (!m_seat.buttonsPressed())
+        if (!m_seat.buttonsPressed() && !grabbing())
             m_seat.notifyPointerFocus(nullptr, {});
     }));
-    m_connections.push_back(in.key.connect(
-        [this](std::uint32_t key, bool pressed, std::uint32_t t) { m_seat.notifyKey(t, key, pressed); }));
+    m_connections.push_back(
+        in.key.connect([this](std::uint32_t k, bool pressed, std::uint32_t t) { key(k, pressed, t); }));
     m_connections.push_back(in.keymap.connect([this](const std::string& keymap) { m_seat.setKeymap(keymap); }));
 
     // Windows appearing, vanishing or restacking change what's under a still pointer.
     m_connections.push_back(desktop.windowMapped.connect([this](Desktop::Window*) { updatePointerFocus(0, false); }));
+    m_connections.push_back(desktop.windowUnmapped.connect([this](Desktop::Window* w) {
+        if (m_grab.window == w)
+            m_grab = {}; // its window is gone: drop the grab
+        updatePointerFocus(0, false);
+    }));
+
+    m_connections.push_back(desktop.moveRequested.connect([this](Desktop::Window* w, std::uint32_t serial) {
+        if (clientGrabAllowed(serial))
+            startGrab(GrabKind::Move, *w, m_lastClientButton, 0);
+    }));
     m_connections.push_back(
-        desktop.windowUnmapped.connect([this](Desktop::Window*) { updatePointerFocus(0, false); }));
+        desktop.resizeRequested.connect([this](Desktop::Window* w, std::uint32_t serial, std::uint32_t edges) {
+            if (clientGrabAllowed(serial) && edges != 0)
+                startGrab(GrabKind::Resize, *w, m_lastClientButton, edges);
+        }));
+
+    log::info("input", "shortcuts: {0}+Enter terminal ({1}), {0}+Q close, {0}+Shift+Esc quit, "
+                       "{0}+drag move, {0}+right-drag resize",
+              m_config.modifierLabel, m_config.terminal);
 }
 
 InputRouter::~InputRouter() = default;
+
+// --------------------------------------------------------------- keyboard --
+
+void InputRouter::key(std::uint32_t key, bool pressed, std::uint32_t timeMs)
+{
+    if (!pressed && m_swallowedKeys.erase(key))
+        return; // the release of a shortcut key
+    if (pressed && m_seat.modifierActive(m_config.modifier.c_str()) && runShortcut(key)) {
+        m_swallowedKeys.insert(key);
+        return;
+    }
+    m_seat.notifyKey(timeMs, key, pressed);
+}
+
+bool InputRouter::runShortcut(std::uint32_t key)
+{
+    const bool shift = m_seat.modifierActive("Shift");
+    switch (key) {
+    case KEY_ENTER:
+    case KEY_KPENTER:
+        if (m_actions.spawn)
+            m_actions.spawn(m_config.terminal);
+        return true;
+    case KEY_Q:
+        if (auto* w = m_desktop.focusedWindow())
+            w->toplevel->requestClose();
+        return true;
+    case KEY_ESC:
+        if (!shift)
+            return false;
+        log::info("input", "quit shortcut");
+        if (m_actions.quit)
+            m_actions.quit();
+        return true;
+    default:
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------- pointer --
 
 void InputRouter::motion(PointF global, std::uint32_t timeMs)
 {
     m_pointer = global;
     m_pointerInside = true;
-    updatePointerFocus(timeMs, true);
+    if (grabbing())
+        updateGrab();
+    else
+        updatePointerFocus(timeMs, true);
 }
 
 void InputRouter::updatePointerFocus(std::uint32_t timeMs, bool sendMotion)
 {
-    if (!m_pointerInside)
+    if (!m_pointerInside || grabbing())
         return;
 
     // While a button is held the pressed surface keeps the pointer (implicit grab).
@@ -65,20 +145,116 @@ void InputRouter::updatePointerFocus(std::uint32_t timeMs, bool sendMotion)
 
 void InputRouter::button(std::uint32_t button, bool pressed, std::uint32_t timeMs)
 {
-    // Click to focus: the first press on a window raises and focuses it.
+    // Compositor grab: nothing reaches clients until its button comes back up.
+    if (grabbing()) {
+        if (!pressed) {
+            m_swallowedButtons.erase(button);
+            m_seat.notifyButton(timeMs, button, false); // keeps the seat's button state honest; no focus, nothing sent
+            if (button == m_grab.button)
+                endGrab(timeMs);
+        }
+        return;
+    }
+    if (!pressed && m_swallowedButtons.erase(button))
+        return;
+
     if (pressed && !m_seat.buttonsPressed()) {
         const auto hit = m_desktop.surfaceAt(m_pointer);
-        if (Desktop::Window* window = hit.surface ? m_desktop.windowOf(hit.surface) : nullptr)
-            m_desktop.focus(window);
+        Desktop::Window* window = hit.surface ? m_desktop.windowOf(hit.surface) : nullptr;
+        if (window)
+            m_desktop.focus(window); // click to focus and raise
+
+        // Mod+drag: the compositor moves/resizes; the client never sees the click.
+        if (window && m_seat.modifierActive(m_config.modifier.c_str()) &&
+            (button == BTN_LEFT || button == BTN_RIGHT)) {
+            m_swallowedButtons.insert(button);
+            std::uint32_t edges = 0;
+            if (button == BTN_RIGHT) { // nearest corner
+                const Rect g = m_desktop.geometryOf(*window);
+                edges |= m_pointer.x < g.x + g.width / 2.0 ? kLeft : kRight;
+                edges |= m_pointer.y < g.y + g.height / 2.0 ? kTop : kBottom;
+            }
+            startGrab(button == BTN_LEFT ? GrabKind::Move : GrabKind::Resize, *window, button, edges);
+            return;
+        }
         if (hit.surface != m_seat.pointerFocus())
             m_seat.notifyPointerFocus(hit.surface, hit.local);
     }
 
+    if (pressed)
+        m_lastClientButton = button;
     m_seat.notifyButton(timeMs, button, pressed);
 
-    // Grab over: the pointer may be above something else by now.
+    // Implicit grab over: the pointer may be above something else by now.
     if (!pressed && !m_seat.buttonsPressed())
         updatePointerFocus(timeMs, false);
+}
+
+// ------------------------------------------------------------------ grabs --
+
+bool InputRouter::clientGrabAllowed(std::uint32_t serial) const
+{
+    // Stale or forged serials (no button held, or an older press) are ignored,
+    // so clients can't start drags on their own.
+    return !grabbing() && m_seat.buttonsPressed() && serial == m_seat.lastButtonSerial();
+}
+
+void InputRouter::startGrab(GrabKind kind, Desktop::Window& window, std::uint32_t button, std::uint32_t edges)
+{
+    // Moving a maximized window un-maximizes it under the pointer.
+    if (kind == GrabKind::Move && window.restore) {
+        const auto restored = window.restore->size();
+        m_desktop.setMaximized(window, false);
+        m_desktop.setFullscreen(window, false);
+        window.position = {std::int32_t(m_pointer.x) - restored.width / 2, std::int32_t(m_pointer.y) - 10};
+    }
+
+    m_seat.notifyPointerFocus(nullptr, {}); // clients see a leave; input is ours until release
+    m_seat.notifyFrame();
+    m_grab = {kind, &window, button, m_pointer, window.position, m_desktop.geometryOf(window), edges};
+    if (kind == GrabKind::Resize)
+        m_desktop.beginResize(window, edges);
+}
+
+void InputRouter::updateGrab()
+{
+    auto& w = *m_grab.window;
+    const PointF d = m_pointer - m_grab.startPointer;
+    const auto dx = std::int32_t(std::lround(d.x)), dy = std::int32_t(std::lround(d.y));
+
+    if (m_grab.kind == GrabKind::Move) {
+        w.position = m_grab.startPosition + Point{dx, dy};
+        return;
+    }
+
+    const Rect s = m_grab.startGeometry;
+    std::int32_t width = s.width, height = s.height;
+    if (m_grab.edges & kLeft)
+        width -= dx;
+    if (m_grab.edges & kRight)
+        width += dx;
+    if (m_grab.edges & kTop)
+        height -= dy;
+    if (m_grab.edges & kBottom)
+        height += dy;
+
+    // Respect the client's limits (0 = none); never below 1px.
+    const Size min = w.toplevel->minSize(), max = w.toplevel->maxSize();
+    width = std::max({width, min.width, 1});
+    height = std::max({height, min.height, 1});
+    if (max.width > 0)
+        width = std::min(width, max.width);
+    if (max.height > 0)
+        height = std::min(height, max.height);
+    w.toplevel->setSize({width, height}); // the client resizes; Desktop anchors left/top edges on commit
+}
+
+void InputRouter::endGrab(std::uint32_t timeMs)
+{
+    if (m_grab.kind == GrabKind::Resize && m_grab.window)
+        m_desktop.endResize(*m_grab.window);
+    m_grab = {};
+    updatePointerFocus(timeMs, true);
 }
 
 } // namespace dragon

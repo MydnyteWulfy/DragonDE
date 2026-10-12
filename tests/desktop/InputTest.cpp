@@ -6,6 +6,7 @@
 #include "desktop/Desktop.h"
 #include "desktop/InputRouter.h"
 #include "protocols/Seat.h"
+#include "protocols/XdgShell.h"
 
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
@@ -46,13 +47,19 @@ protected:
     wl_keyboard* keyboard = nullptr;
     wl_data_device_manager* ddm = nullptr;
     ClientInput in;
+    int quits = 0;
+    std::vector<std::string> spawned;
 
     void SetUp() override
     {
         ServerFixture::SetUp();
         desktop = std::make_unique<Desktop>(*server);
         desktop->setArea({0, 0, 800, 600});
-        router = std::make_unique<InputRouter>(backend, *desktop, server->seat());
+        router = std::make_unique<InputRouter>(
+            backend, *desktop, server->seat(),
+            WindowManagerConfig{.modifier = "Mod1", .modifierLabel = "Alt", .terminal = "test-terminal"},
+            WindowManagerActions{.quit = [this] { ++quits; },
+                                 .spawn = [this](const std::string& cmd) { spawned.push_back(cmd); }});
 
         static const wl_registry_listener listener = {
             .global =
@@ -387,4 +394,143 @@ TEST_F(InputTest, ClipboardCopyAndPaste)
     EXPECT_EQ(read(fds[0], buf, sizeof(buf)), 5);
     EXPECT_STREQ(buf, "hello");
     close(fds[0]);
+}
+
+// ------------------------------------------------------- window management --
+
+TEST_F(InputTest, AltDragMovesWindowAndClientNeverSeesTheClick)
+{
+    auto w = window(100, 100); // at (350, 250)
+    move(360, 260);
+    in.log.clear();
+
+    key(KEY_LEFTALT, true);
+    click(BTN_LEFT, true);
+    move(410, 290);
+    click(BTN_LEFT, false);
+    key(KEY_LEFTALT, false);
+
+    EXPECT_EQ(desktop->windows()[0]->position, (Point{400, 280}));
+    for (const auto& e : in.log)
+        EXPECT_FALSE(e.starts_with("button")) << "the grab must not leak the click: " << e;
+    EXPECT_EQ(in.pointerSurface, w->surface) << "pointer re-enters after the grab";
+}
+
+TEST_F(InputTest, TitleBarDragThroughMoveRequest)
+{
+    auto w = window(100, 100);
+    move(360, 260);
+    click(BTN_LEFT, true); // the client sees this press on its "title bar"...
+    xdg_toplevel_move(w->toplevel, seat, in.lastButtonSerial); // ...and asks us to move it
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(in.pointerSurface, nullptr) << "pointer leaves the client during the move";
+
+    move(460, 360);
+    click(BTN_LEFT, false);
+    EXPECT_EQ(desktop->windows()[0]->position, (Point{450, 350}));
+}
+
+TEST_F(InputTest, MoveRequestWithStaleSerialIsIgnored)
+{
+    auto w = window(100, 100);
+    move(360, 260);
+    click(BTN_LEFT, true);
+    const std::uint32_t serial = in.lastButtonSerial;
+    click(BTN_LEFT, false);
+
+    xdg_toplevel_move(w->toplevel, seat, serial); // button already released
+    ASSERT_TRUE(roundtrip());
+    move(460, 360);
+
+    EXPECT_EQ(desktop->windows()[0]->position, (Point{350, 250}));
+}
+
+TEST_F(InputTest, ResizeFromBottomRightSendsSizesAndResizingState)
+{
+    auto w = window(100, 100);
+    move(445, 345);
+    click(BTN_LEFT, true);
+    xdg_toplevel_resize(w->toplevel, seat, in.lastButtonSerial, XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT);
+    ASSERT_TRUE(roundtrip());
+
+    move(485, 365);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(w->width, 140);
+    EXPECT_EQ(w->height, 120);
+    EXPECT_TRUE(w->hasState(XDG_TOPLEVEL_STATE_RESIZING));
+
+    click(BTN_LEFT, false);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_FALSE(w->hasState(XDG_TOPLEVEL_STATE_RESIZING));
+}
+
+TEST_F(InputTest, ResizingFromTheLeftKeepsTheRightEdge)
+{
+    auto w = window(100, 100); // x 350..450
+    move(355, 300);
+    key(KEY_LEFTALT, true);
+    click(BTN_RIGHT, true); // Alt+right-drag: nearest corner is the left one
+    move(325, 300);
+    ASSERT_TRUE(roundtrip());
+    ASSERT_EQ(w->width, 130);
+
+    // The client follows the configure with a wider buffer.
+    xdg_surface_ack_configure(w->xdg, w->lastSerial);
+    wl_surface_attach(w->surface, makeBuffer(130, 100), 0, 0);
+    wl_surface_commit(w->surface);
+    ASSERT_TRUE(roundtrip());
+
+    EXPECT_EQ(desktop->windows()[0]->position.x, 320) << "right edge stays at 450";
+    click(BTN_RIGHT, false);
+    key(KEY_LEFTALT, false);
+}
+
+TEST_F(InputTest, ShortcutsRunAndAreHiddenFromClients)
+{
+    auto w = window(100, 100);
+    in.log.clear();
+
+    key(KEY_LEFTALT, true);
+    key(KEY_ENTER, true);
+    key(KEY_ENTER, false);
+    key(KEY_Q, true);
+    key(KEY_Q, false);
+    key(KEY_LEFTSHIFT, true);
+    key(KEY_ESC, true);
+    key(KEY_ESC, false);
+    key(KEY_LEFTSHIFT, false);
+    key(KEY_LEFTALT, false);
+    ASSERT_TRUE(roundtrip());
+
+    EXPECT_EQ(spawned, (std::vector<std::string>{"test-terminal"}));
+    EXPECT_TRUE(w->closed);
+    EXPECT_EQ(quits, 1);
+    for (std::uint32_t k : {KEY_ENTER, KEY_Q, KEY_ESC}) {
+        EXPECT_FALSE(in.saw(std::format("key {} 1", k))) << k;
+        EXPECT_FALSE(in.saw(std::format("key {} 0", k))) << k;
+    }
+    EXPECT_TRUE(in.saw(std::format("key {} 1", KEY_LEFTALT))) << "plain modifiers still reach the client";
+}
+
+TEST_F(InputTest, MaximizeFillsTheAreaAndRestores)
+{
+    auto w = window(100, 100);
+    xdg_toplevel_set_maximized(w->toplevel);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(w->width, 800);
+    EXPECT_EQ(w->height, 600);
+    EXPECT_TRUE(w->hasState(XDG_TOPLEVEL_STATE_MAXIMIZED));
+    EXPECT_EQ(desktop->windows()[0]->position, (Point{0, 0}));
+
+    xdg_toplevel_unset_maximized(w->toplevel);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(w->width, 100);
+    EXPECT_FALSE(w->hasState(XDG_TOPLEVEL_STATE_MAXIMIZED));
+    EXPECT_EQ(desktop->windows()[0]->position, (Point{350, 250}));
+}
+
+TEST_F(InputTest, CapabilitiesAdvertiseMaximizeAndFullscreen)
+{
+    auto w = window(100, 100);
+    EXPECT_TRUE(w->sawCapabilities);
 }

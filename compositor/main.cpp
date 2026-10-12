@@ -3,6 +3,7 @@
 #include "backend/nested/NestedBackend.h"
 #include "core/EventLoop.h"
 #include "core/Log.h"
+#include "core/Process.h"
 #include "desktop/Desktop.h"
 #include "desktop/InputRouter.h"
 #include "desktop/OutputRenderer.h"
@@ -138,7 +139,20 @@ int main()
         server.removeOutput(*output);
     });
     auto backendQuit = backend->quitRequested.connect(quit);
-    InputRouter input(*backend, desktop, server.seat());
+    // Shortcut modifier: Super, except nested where the parent compositor
+    // usually keeps Super shortcuts (like Super+drag) for itself.
+    WindowManagerConfig wm;
+    const auto mod = env("DRAGON_MOD");
+    const bool nested = std::string_view(backend->name()) == "nested";
+    if (mod == "alt" || (mod.empty() && nested))
+        wm.modifier = "Mod1", wm.modifierLabel = "Alt";
+    else if (mod == "ctrl")
+        wm.modifier = "Control", wm.modifierLabel = "Ctrl";
+    if (const auto terminal = env("DRAGON_TERMINAL"); !terminal.empty())
+        wm.terminal = terminal;
+    InputRouter input(*backend, desktop, server.seat(), wm,
+                      {.quit = quit, .spawn = [](const std::string& cmd) { process::spawn(cmd); }});
+    auto reap = loop.addSignal(SIGCHLD, [] { process::reapChildren(); });
 
     if (!backend->start(*gpu))
         return EXIT_FAILURE;
@@ -150,6 +164,10 @@ int main()
     }
     log::info("core", "running: {} backend, {} output(s), WAYLAND_DISPLAY={}", backend->name(),
               backend->outputs().size(), socket);
+    // Everything we launch connects to us. (The nested backend is already
+    // connected to its parent, so changing our own environment is safe now.)
+    setenv("WAYLAND_DISPLAY", socket, 1);
+    unsetenv("WAYLAND_SOCKET");
 
     while (running)
         loop.dispatch(-1);
