@@ -22,6 +22,7 @@ constexpr std::array kDeviceExtensions = {
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,   // sync_file <-> semaphore
     VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,    // ownership transfer to KMS / other processes
     VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME,     // match the device to a DRM node
+    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,         // bind textures without descriptor pools
 };
 
 bool hasLayer(const char* name)
@@ -247,7 +248,8 @@ bool VulkanDevice::createDevice()
             log::error("vulkan", "missing entry point {}", name);
         return fn != nullptr;
     };
-    return load(m_fn.getMemoryFdPropertiesKHR, "vkGetMemoryFdPropertiesKHR") &&
+    return load(m_fn.cmdPushDescriptorSetKHR, "vkCmdPushDescriptorSetKHR") &&
+           load(m_fn.getMemoryFdPropertiesKHR, "vkGetMemoryFdPropertiesKHR") &&
            load(m_fn.getSemaphoreFdKHR, "vkGetSemaphoreFdKHR") &&
            load(m_fn.importSemaphoreFdKHR, "vkImportSemaphoreFdKHR") &&
            load(m_fn.getImageDrmFormatModifierPropertiesEXT, "vkGetImageDrmFormatModifierPropertiesEXT");

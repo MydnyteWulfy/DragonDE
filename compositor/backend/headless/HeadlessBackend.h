@@ -3,6 +3,7 @@
 #include "backend/Backend.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace dragon {
 
@@ -17,6 +18,8 @@ public:
         std::uint32_t width = 1920;
         std::uint32_t height = 1080;
         std::uint32_t refreshHz = 60;
+        // Restrict buffer layouts (e.g. {DRM_FORMAT_MOD_LINEAR} so tests can read pixels back).
+        std::vector<std::uint64_t> modifiers;
     };
 
     HeadlessBackend(EventLoop& loop, Config config) : m_loop(loop), m_config(config) {}

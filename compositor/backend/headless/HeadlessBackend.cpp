@@ -4,6 +4,7 @@
 #include "core/Log.h"
 #include "render/Gpu.h"
 
+#include <algorithm>
 #include <chrono>
 #include <drm_fourcc.h>
 #include <format>
@@ -20,7 +21,7 @@ public:
         : Output(std::move(name)), m_period(period)
     {
         setMode({std::int32_t(swapchain->width()), std::int32_t(swapchain->height()), refreshMhz});
-        m_swapchain = std::move(swapchain);
+        setSwapchain(std::move(swapchain));
         // Fixed-rate "vblank": fire, then re-arm, whether or not a frame was drawn.
         m_timer = loop.addTimer([this] {
             m_timer.arm(m_period);
@@ -33,7 +34,7 @@ public:
     {
         // Nobody scans this out; the renderer's fences already order reuse.
         Swapchain::release(slot);
-        ++m_framesPresented;
+        markPresented(slot);
     }
 
 private:
@@ -45,7 +46,11 @@ private:
 
 bool HeadlessBackend::start(Gpu& gpu)
 {
-    const auto modifiers = gpu.renderModifiers(DRM_FORMAT_XRGB8888);
+    auto modifiers = gpu.renderModifiers(DRM_FORMAT_XRGB8888);
+    if (!m_config.modifiers.empty()) {
+        std::erase_if(modifiers, [this](std::uint64_t m) { return std::ranges::find(m_config.modifiers, m) ==
+                                                                 m_config.modifiers.end(); });
+    }
     if (modifiers.empty()) {
         log::error("backend", "headless: GPU can't render XRGB8888");
         return false;

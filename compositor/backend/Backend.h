@@ -46,6 +46,8 @@ public:
     virtual void present(SwapchainSlot& slot) = 0;
 
     std::uint64_t framesPresented() const { return m_framesPresented; }
+    // The slot shown by the latest present() (for screenshots and tests).
+    const SwapchainSlot* lastPresented() const { return m_lastPresented; }
 
     // Now is a good time to render a new frame (vblank, frame callback, timer).
     Signal<> frame;
@@ -60,12 +62,26 @@ protected:
         modeChanged.emit();
     }
 
+    // Backends call this from present().
+    void markPresented(SwapchainSlot& slot)
+    {
+        m_lastPresented = &slot;
+        ++m_framesPresented;
+    }
+    // Replacing the swapchain invalidates lastPresented().
+    void setSwapchain(std::unique_ptr<Swapchain> swapchain)
+    {
+        m_lastPresented = nullptr;
+        m_swapchain = std::move(swapchain);
+    }
+
     std::unique_ptr<Swapchain> m_swapchain;
-    std::uint64_t m_framesPresented = 0;
 
 private:
     std::string m_name;
     OutputMode m_mode;
+    const SwapchainSlot* m_lastPresented = nullptr;
+    std::uint64_t m_framesPresented = 0;
 };
 
 // Where outputs (and later input devices) come from.

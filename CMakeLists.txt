@@ -18,9 +18,11 @@ include(cmake/DragonCompileOptions.cmake)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WaylandServer REQUIRED IMPORTED_TARGET wayland-server>=1.23)
 include(cmake/DragonProtocols.cmake)
+include(cmake/DragonShaders.cmake)
 
 add_subdirectory(tools/scanner)
 add_subdirectory(compositor)
+add_subdirectory(tools/demo-client)
 
 if(DRAGON_BUILD_TESTS)
     enable_testing()

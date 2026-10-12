@@ -4,12 +4,43 @@
 #include "render/DmaBuf.h"
 #include "render/vulkan/VulkanDevice.h"
 #include "render/vulkan/VulkanImage.h"
+#include "render/vulkan/VulkanTexture.h"
+
+#include <bit>
 
 namespace dragon::vk {
 
 namespace {
 constexpr VkImageSubresourceRange kColorRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+constexpr std::uint32_t kQuadVert[] = {
+#include "shaders/quad.vert.spv.inc"
+};
+constexpr std::uint32_t kTextureFrag[] = {
+#include "shaders/texture.frag.spv.inc"
+};
+
+// Must match `Push` in the shaders.
+struct QuadPush {
+    float rect[4]; // NDC x, y, width, height
+    float uv[4];
+    float alpha;
+    std::uint32_t opaque;
+};
+static_assert(sizeof(QuadPush) == 40);
+
+VkShaderModule createShader(VkDevice dev, std::span<const std::uint32_t> code)
+{
+    VkShaderModuleCreateInfo info{
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = code.size_bytes(),
+        .pCode = code.data(),
+    };
+    VkShaderModule module = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(dev, &info, nullptr, &module), "vkCreateShaderModule");
+    return module;
 }
+} // namespace
 
 std::unique_ptr<VulkanRenderer> VulkanRenderer::create(VulkanDevice& device)
 {
@@ -24,10 +55,32 @@ VulkanRenderer::~VulkanRenderer()
     VkDevice dev = m_device.device();
     if (m_fence)
         vkWaitForFences(dev, 1, &m_fence, VK_TRUE, UINT64_MAX);
+    for (auto& [format, pipeline] : m_pipelines)
+        vkDestroyPipeline(dev, pipeline, nullptr);
+    vkDestroyShaderModule(dev, m_fragShader, nullptr);
+    vkDestroyShaderModule(dev, m_vertShader, nullptr);
+    vkDestroyPipelineLayout(dev, m_pipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(dev, m_setLayout, nullptr);
+    vkDestroySampler(dev, m_sampler, nullptr);
     vkDestroySemaphore(dev, m_signalSemaphore, nullptr);
     vkDestroySemaphore(dev, m_waitSemaphore, nullptr);
     vkDestroyFence(dev, m_fence, nullptr);
     vkDestroyCommandPool(dev, m_pool, nullptr); // frees m_cmd
+}
+
+std::uint64_t VulkanRenderer::completedFrame() const
+{
+    const bool idle = vkGetFenceStatus(m_device.device(), m_fence) == VK_SUCCESS;
+    return idle ? m_submitted : m_submitted - 1;
+}
+
+std::unique_ptr<VulkanTexture> VulkanRenderer::createTexture(std::uint32_t width, std::uint32_t height,
+                                                             VkFormat format, bool opaque)
+{
+    std::unique_ptr<VulkanTexture> tex(new VulkanTexture(*this));
+    if (!tex->init(width, height, format, opaque))
+        return nullptr;
+    return tex;
 }
 
 bool VulkanRenderer::init()
@@ -64,7 +117,144 @@ bool VulkanRenderer::init()
         .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
     };
     VkSemaphoreCreateInfo signalInfo{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &exportInfo};
-    return check(vkCreateSemaphore(dev, &signalInfo, nullptr, &m_signalSemaphore), "vkCreateSemaphore(signal)");
+    if (!check(vkCreateSemaphore(dev, &signalInfo, nullptr, &m_signalSemaphore), "vkCreateSemaphore(signal)"))
+        return false;
+    return createPipelineLayout();
+}
+
+bool VulkanRenderer::createPipelineLayout()
+{
+    VkDevice dev = m_device.device();
+
+    VkSamplerCreateInfo samplerInfo{
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .maxLod = VK_LOD_CLAMP_NONE,
+    };
+    if (!check(vkCreateSampler(dev, &samplerInfo, nullptr, &m_sampler), "vkCreateSampler"))
+        return false;
+
+    // One texture, pushed per draw (VK_KHR_push_descriptor): no pools, no sets to manage.
+    VkDescriptorSetLayoutBinding binding{
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .pImmutableSamplers = &m_sampler,
+    };
+    VkDescriptorSetLayoutCreateInfo setInfo{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+        .bindingCount = 1,
+        .pBindings = &binding,
+    };
+    if (!check(vkCreateDescriptorSetLayout(dev, &setInfo, nullptr, &m_setLayout), "vkCreateDescriptorSetLayout"))
+        return false;
+
+    VkPushConstantRange push{
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = sizeof(QuadPush),
+    };
+    VkPipelineLayoutCreateInfo layoutInfo{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &m_setLayout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push,
+    };
+    if (!check(vkCreatePipelineLayout(dev, &layoutInfo, nullptr, &m_pipelineLayout), "vkCreatePipelineLayout"))
+        return false;
+
+    m_vertShader = createShader(dev, kQuadVert);
+    m_fragShader = createShader(dev, kTextureFrag);
+    return m_vertShader && m_fragShader;
+}
+
+VkPipeline VulkanRenderer::pipelineFor(VkFormat format)
+{
+    if (auto it = m_pipelines.find(format); it != m_pipelines.end())
+        return it->second;
+
+    const VkPipelineShaderStageCreateInfo stages[] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = m_vertShader, .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = m_fragShader, .pName = "main"},
+    };
+    VkPipelineVertexInputStateCreateInfo vertexInput{.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+    };
+    VkPipelineViewportStateCreateInfo viewport{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .scissorCount = 1,
+    };
+    VkPipelineRasterizationStateCreateInfo raster{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode = VK_CULL_MODE_NONE,
+        .lineWidth = 1.0f,
+    };
+    VkPipelineMultisampleStateCreateInfo multisample{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+    };
+    // Premultiplied alpha: out = src + dst * (1 - src.a)
+    VkPipelineColorBlendAttachmentState blendAttachment{
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                          VK_COLOR_COMPONENT_A_BIT,
+    };
+    VkPipelineColorBlendStateCreateInfo blend{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &blendAttachment,
+    };
+    const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2,
+        .pDynamicStates = dynamicStates,
+    };
+    VkPipelineRenderingCreateInfo rendering{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &format,
+    };
+    VkGraphicsPipelineCreateInfo info{
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = &rendering,
+        .stageCount = 2,
+        .pStages = stages,
+        .pVertexInputState = &vertexInput,
+        .pInputAssemblyState = &inputAssembly,
+        .pViewportState = &viewport,
+        .pRasterizationState = &raster,
+        .pMultisampleState = &multisample,
+        .pColorBlendState = &blend,
+        .pDynamicState = &dynamic,
+        .layout = m_pipelineLayout,
+    };
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (!check(vkCreateGraphicsPipelines(m_device.device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline),
+               "vkCreateGraphicsPipelines"))
+        return VK_NULL_HANDLE;
+    m_pipelines.emplace(format, pipeline);
+    return pipeline;
 }
 
 bool VulkanRenderer::waitIdle(std::chrono::nanoseconds timeout)
@@ -97,7 +287,7 @@ bool VulkanRenderer::importWaitSemaphore(VulkanImage& target)
     return true;
 }
 
-bool VulkanRenderer::clear(VulkanImage& target, std::array<float, 4> rgba)
+bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std::span<const TextureDraw> draws)
 {
     // One frame in flight for now; the frame pacing work will add more.
     if (!waitIdle())
@@ -111,6 +301,10 @@ bool VulkanRenderer::clear(VulkanImage& target, std::array<float, 4> rgba)
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     vkBeginCommandBuffer(m_cmd, &begin);
+
+    const std::uint64_t frame = m_submitted + 1;
+    for (const auto& d : draws)
+        d.texture->recordUpload(m_cmd, frame);
 
     // Acquire from FOREIGN. UNDEFINED old layout: we overwrite every pixel.
     VkImageMemoryBarrier2 acquire{
@@ -149,6 +343,48 @@ bool VulkanRenderer::clear(VulkanImage& target, std::array<float, 4> rgba)
         .pColorAttachments = &color,
     };
     vkCmdBeginRendering(m_cmd, &rendering);
+
+    if (!draws.empty()) {
+        const VkExtent2D extent = target.extent();
+        if (VkPipeline pipeline = pipelineFor(target.format())) {
+            vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            const VkViewport vp{0.0f, 0.0f, float(extent.width), float(extent.height), 0.0f, 1.0f};
+            const VkRect2D scissor{{0, 0}, extent};
+            vkCmdSetViewport(m_cmd, 0, 1, &vp);
+            vkCmdSetScissor(m_cmd, 0, 1, &scissor);
+
+            const float sx = 2.0f / float(extent.width), sy = 2.0f / float(extent.height);
+            for (const auto& d : draws) {
+                if (!d.texture->ready())
+                    continue;
+                VkDescriptorImageInfo image{
+                    .imageView = d.texture->m_view,
+                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                };
+                VkWriteDescriptorSet write{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstBinding = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    .pImageInfo = &image,
+                };
+                m_device.fn().cmdPushDescriptorSetKHR(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0,
+                                                      1, &write);
+                const QuadPush push{
+                    .rect = {float(d.dst.x) * sx - 1.0f, float(d.dst.y) * sy - 1.0f, float(d.dst.width) * sx,
+                             float(d.dst.height) * sy},
+                    .uv = {0.0f, 0.0f, 1.0f, 1.0f},
+                    .alpha = d.alpha,
+                    .opaque = d.texture->opaque() ? 1u : 0u,
+                };
+                vkCmdPushConstants(m_cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(push), &push);
+                vkCmdDraw(m_cmd, 4, 1, 0, 0);
+                d.texture->m_lastUsedFrame = frame;
+            }
+        }
+    }
+
     vkCmdEndRendering(m_cmd);
 
     // Release to FOREIGN in GENERAL, the layout external consumers expect.
@@ -204,6 +440,7 @@ bool VulkanRenderer::submit(VulkanImage& target, bool waitOnBuffer)
     vkResetFences(m_device.device(), 1, &m_fence);
     if (!check(vkQueueSubmit2(m_device.queue(), 1, &submit, m_fence), "vkQueueSubmit2"))
         return false;
+    ++m_submitted;
 
     // Hand our completion to implicit sync: the next reader of the dma-buf
     // (KMS, the parent compositor) waits for it in the kernel.

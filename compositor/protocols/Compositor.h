@@ -59,7 +59,9 @@ struct SurfaceState {
     };
 
     std::uint32_t committed = 0;
-    BufferLock buffer;   // empty: no buffer (unmapped)
+    BufferLock buffer;   // may be released early (shm is copied on commit), see hasBuffer
+    bool hasBuffer = false; // a buffer is attached, even if its lock was released
+    Size bufferSize;
     Point offset;        // accumulated attach/offset delta, consumed by the role
     Region surfaceDamage; // surface-local coordinates
     Region bufferDamage;  // buffer coordinates
@@ -86,9 +88,19 @@ public:
     Server& server() const { return m_server; }
 
     const SurfaceState& state() const { return m_current; }
+    // The committed buffer, until releaseBuffer(). Null when none is attached.
     ClientBuffer* buffer() const { return m_current.buffer.get(); }
+    // Whether the surface shows something (a buffer is attached), even after
+    // its buffer was released.
+    bool hasContent() const { return m_current.hasBuffer; }
     // Surface-local size: buffer size after transform and scale. Empty without a buffer.
     Size size() const;
+
+    // We copied the contents (wl_shm): give the buffer back to the client now
+    // instead of when it's replaced.
+    void releaseBuffer() { m_current.buffer.reset(); }
+    // Damage was consumed (uploaded / repainted).
+    void clearDamage();
 
     // Consumes the accumulated attach offset (the role moves the window by it).
     Point takeOffset();

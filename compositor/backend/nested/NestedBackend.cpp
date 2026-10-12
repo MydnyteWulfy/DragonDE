@@ -211,7 +211,8 @@ public:
         }
         wl_surface_commit(m_surface);
 
-        if (m_framesPresented++ == 0)
+        markPresented(slot);
+        if (framesPresented() == 1)
             log::info("backend", "nested: first frame on {} ({}x{}, modifier {:#018x})", name(),
                       m_swapchain->width(), m_swapchain->height(), slot.buffer->dmabuf().modifier);
     }
@@ -247,7 +248,7 @@ private:
     {
         m_gpu.renderer().waitIdle();
         destroyBuffers();
-        m_swapchain = Swapchain::create(m_gpu, width, height, m_format, m_modifiers, GBM_BO_USE_RENDERING);
+        setSwapchain(Swapchain::create(m_gpu, width, height, m_format, m_modifiers, GBM_BO_USE_RENDERING));
         if (!m_swapchain) {
             log::error("backend", "nested: cannot create {}x{} swapchain", width, height);
             return false;

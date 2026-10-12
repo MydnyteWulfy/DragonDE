@@ -16,6 +16,7 @@ bool check(VkResult result, std::string_view what);
 
 // Extension entry points, loaded once per device.
 struct DeviceFunctions {
+    PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSetKHR = nullptr;
     PFN_vkGetMemoryFdPropertiesKHR getMemoryFdPropertiesKHR = nullptr;
     PFN_vkGetSemaphoreFdKHR getSemaphoreFdKHR = nullptr;
     PFN_vkImportSemaphoreFdKHR importSemaphoreFdKHR = nullptr;

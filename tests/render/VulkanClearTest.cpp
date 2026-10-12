@@ -7,7 +7,9 @@
 #include "render/vulkan/VulkanDevice.h"
 #include "render/vulkan/VulkanImage.h"
 #include "render/vulkan/VulkanRenderer.h"
+#include "render/vulkan/VulkanTexture.h"
 
+#include <cstdlib>
 #include <drm_fourcc.h>
 #include <gbm.h>
 #include <gtest/gtest.h>
@@ -120,4 +122,115 @@ TEST_F(GpuFixture, ClearsTiledBufferWithDriverChosenModifier)
     for (int i = 0; i < 3; ++i)
         ASSERT_TRUE(renderer->clear(*image, {0.1f * float(i), 0.2f, 0.3f, 1.0f}));
     ASSERT_TRUE(renderer->waitIdle());
+}
+
+// ------------------------------------------------------------ textured quads --
+
+namespace {
+struct LinearTarget {
+    std::unique_ptr<GbmBuffer> buffer;
+    std::unique_ptr<vk::VulkanImage> image;
+};
+
+LinearTarget makeLinearTarget(GbmAllocator& allocator, vk::VulkanDevice& device, std::uint32_t w, std::uint32_t h)
+{
+    const std::uint64_t linear = DRM_FORMAT_MOD_LINEAR;
+    LinearTarget t;
+    t.buffer = allocator.allocate(w, h, DRM_FORMAT_XRGB8888, {&linear, 1}, GBM_BO_USE_RENDERING);
+    if (t.buffer)
+        t.image = vk::VulkanImage::importDmaBuf(device, t.buffer->dmabuf(), VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    return t;
+}
+
+// |a - b| <= 1 per channel (blending rounds).
+bool closeTo(std::uint32_t a, std::uint32_t b)
+{
+    for (int shift = 0; shift < 24; shift += 8) {
+        const int ca = int((a >> shift) & 0xff), cb = int((b >> shift) & 0xff);
+        if (std::abs(ca - cb) > 1)
+            return false;
+    }
+    return true;
+}
+} // namespace
+
+TEST_F(GpuFixture, TextureLandsOnExactPixels)
+{
+    auto target = makeLinearTarget(*allocator, *device, 64, 48);
+    ASSERT_NE(target.image, nullptr);
+
+    // B8G8R8A8 texels read as little-endian 0xAARRGGBB words.
+    const std::uint32_t texels[] = {0xffff0000, 0xff00ff00, 0xff0000ff, 0xffffffff};
+    auto tex = renderer->createTexture(2, 2, VK_FORMAT_B8G8R8A8_UNORM, false);
+    ASSERT_NE(tex, nullptr);
+    const Rect full{0, 0, 2, 2};
+    tex->write(texels, 8, {&full, 1});
+
+    const vk::TextureDraw draw{tex.get(), {10, 10, 2, 2}};
+    ASSERT_TRUE(renderer->render(*target.image, {0, 0, 0, 1}, {&draw, 1}));
+    ASSERT_TRUE(renderer->waitIdle());
+
+    EXPECT_EQ(readPixel(*target.buffer, 10, 10) & 0xffffff, 0xff0000u);
+    EXPECT_EQ(readPixel(*target.buffer, 11, 10) & 0xffffff, 0x00ff00u);
+    EXPECT_EQ(readPixel(*target.buffer, 10, 11) & 0xffffff, 0x0000ffu);
+    EXPECT_EQ(readPixel(*target.buffer, 11, 11) & 0xffffff, 0xffffffu);
+    EXPECT_EQ(readPixel(*target.buffer, 9, 9) & 0xffffff, 0x000000u);
+    EXPECT_EQ(readPixel(*target.buffer, 12, 12) & 0xffffff, 0x000000u);
+}
+
+TEST_F(GpuFixture, PremultipliedAlphaBlendsOverBackground)
+{
+    auto target = makeLinearTarget(*allocator, *device, 16, 16);
+    ASSERT_NE(target.image, nullptr);
+
+    const std::uint32_t halfRed = 0x80800000; // 50% opaque red, premultiplied
+    auto tex = renderer->createTexture(1, 1, VK_FORMAT_B8G8R8A8_UNORM, false);
+    const Rect full{0, 0, 1, 1};
+    tex->write(&halfRed, 4, {&full, 1});
+
+    const vk::TextureDraw draw{tex.get(), {0, 0, 16, 16}};
+    ASSERT_TRUE(renderer->render(*target.image, {1, 1, 1, 1}, {&draw, 1}));
+    ASSERT_TRUE(renderer->waitIdle());
+
+    // red: 0.5 + 1 * 0.5 = 1.0; green/blue: 0 + 1 * 0.5 = 0.5
+    EXPECT_PRED2(closeTo, readPixel(*target.buffer, 8, 8) & 0xffffff, 0xff8080u);
+}
+
+TEST_F(GpuFixture, OpaqueTextureIgnoresAlpha)
+{
+    auto target = makeLinearTarget(*allocator, *device, 16, 16);
+    ASSERT_NE(target.image, nullptr);
+
+    const std::uint32_t xrgbRed = 0x00ff0000; // XRGB: the X byte is garbage, often 0
+    auto tex = renderer->createTexture(1, 1, VK_FORMAT_B8G8R8A8_UNORM, /*opaque=*/true);
+    const Rect full{0, 0, 1, 1};
+    tex->write(&xrgbRed, 4, {&full, 1});
+
+    const vk::TextureDraw draw{tex.get(), {0, 0, 16, 16}};
+    ASSERT_TRUE(renderer->render(*target.image, {0, 0, 1, 1}, {&draw, 1}));
+    ASSERT_TRUE(renderer->waitIdle());
+
+    EXPECT_EQ(readPixel(*target.buffer, 8, 8) & 0xffffff, 0xff0000u) << "blue background must not show through";
+}
+
+TEST_F(GpuFixture, PartialTextureUpdateKeepsTheRest)
+{
+    auto target = makeLinearTarget(*allocator, *device, 16, 16);
+    ASSERT_NE(target.image, nullptr);
+    auto tex = renderer->createTexture(2, 1, VK_FORMAT_B8G8R8A8_UNORM, false);
+
+    const std::uint32_t red[] = {0xffff0000, 0xffff0000};
+    const Rect full{0, 0, 2, 1};
+    tex->write(red, 8, {&full, 1});
+    const vk::TextureDraw draw{tex.get(), {0, 0, 2, 1}};
+    ASSERT_TRUE(renderer->render(*target.image, {0, 0, 0, 1}, {&draw, 1}));
+
+    const std::uint32_t green[] = {0, 0xff00ff00}; // only texel 1 is copied
+    const Rect right{1, 0, 1, 1};
+    tex->write(green, 8, {&right, 1}); // waits for the frame above to stop reading the staging buffer
+    ASSERT_TRUE(renderer->render(*target.image, {0, 0, 0, 1}, {&draw, 1}));
+    ASSERT_TRUE(renderer->waitIdle());
+
+    EXPECT_EQ(readPixel(*target.buffer, 0, 0) & 0xffffff, 0xff0000u);
+    EXPECT_EQ(readPixel(*target.buffer, 1, 0) & 0xffffff, 0x00ff00u);
 }

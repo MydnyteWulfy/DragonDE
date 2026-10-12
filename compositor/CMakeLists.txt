@@ -41,15 +41,29 @@ add_library(dragon_render STATIC
     render/vulkan/VulkanDevice.cpp
     render/vulkan/VulkanImage.cpp
     render/vulkan/VulkanRenderer.cpp
+    render/vulkan/VulkanTexture.cpp
 )
 target_link_libraries(dragon_render
     PUBLIC dragon_core Vulkan::Vulkan PkgConfig::Gbm PkgConfig::LibDrm
     PRIVATE dragon::options
 )
+dragon_add_shaders(dragon_render
+    render/vulkan/shaders/quad.vert
+    render/vulkan/shaders/texture.frag
+)
 
-# Backends: where outputs and input come from.
+# Client-side protocol headers: the nested backend, tools and tests are clients.
 pkg_check_modules(WaylandClient REQUIRED IMPORTED_TARGET wayland-client)
 
+add_library(dragon_client_protocols INTERFACE)
+target_link_libraries(dragon_client_protocols INTERFACE dragon_protocol_tables PkgConfig::WaylandClient)
+dragon_add_client_protocol(dragon_client_protocols ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
+dragon_add_client_protocol(dragon_client_protocols
+    ${WAYLAND_PROTOCOLS_DIR}/stable/linux-dmabuf/linux-dmabuf-v1.xml)
+dragon_add_client_protocol(dragon_client_protocols
+    ${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml)
+
+# Backends: where outputs and input come from.
 add_library(dragon_backend STATIC
     backend/Backend.cpp
     backend/headless/HeadlessBackend.cpp
@@ -57,12 +71,8 @@ add_library(dragon_backend STATIC
 )
 target_link_libraries(dragon_backend
     PUBLIC dragon_render
-    PRIVATE dragon_protocol_tables PkgConfig::WaylandClient dragon::options
+    PRIVATE dragon_client_protocols dragon::options
 )
-dragon_add_client_protocol(dragon_backend ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
-dragon_add_client_protocol(dragon_backend ${WAYLAND_PROTOCOLS_DIR}/stable/linux-dmabuf/linux-dmabuf-v1.xml)
-dragon_add_client_protocol(dragon_backend
-    ${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml)
 
 # Server side: protocol implementations and the globals that expose them.
 add_library(dragon_server STATIC
@@ -77,5 +87,16 @@ target_link_libraries(dragon_server
     PRIVATE dragon::options
 )
 
+# What's on screen: window placement, surface textures, per-output rendering.
+add_library(dragon_desktop STATIC
+    desktop/Desktop.cpp
+    desktop/OutputRenderer.cpp
+    desktop/SurfaceTextures.cpp
+)
+target_link_libraries(dragon_desktop
+    PUBLIC dragon_server dragon_render
+    PRIVATE dragon::options
+)
+
 add_executable(dragon-compositor main.cpp)
-target_link_libraries(dragon-compositor PRIVATE dragon_server dragon::options)
+target_link_libraries(dragon-compositor PRIVATE dragon_desktop dragon::options)

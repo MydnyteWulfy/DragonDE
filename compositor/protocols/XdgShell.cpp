@@ -143,7 +143,7 @@ void XdgWmBase::handleGetXdgSurface(std::uint32_t id, wl_resource* surface)
         postError(proto::XdgWmBaseError::Role, "wl_surface already has the role {}", s->roleName());
         return;
     }
-    if (s->buffer()) {
+    if (s->hasContent()) {
         postError(proto::XdgWmBaseError::InvalidSurfaceState, "wl_surface already has a buffer committed");
         return;
     }
@@ -248,7 +248,7 @@ void XdgSurface::commit()
         return;
     }
 
-    const bool hasBuffer = m_surface->buffer() != nullptr;
+    const bool hasBuffer = m_surface->hasContent();
     if (hasBuffer && !m_mapped) {
         m_mapped = true;
         mapped.emit();

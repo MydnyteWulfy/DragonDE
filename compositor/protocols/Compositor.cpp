@@ -52,8 +52,11 @@ void FrameCallbackList::sendDone(std::uint32_t msec)
 
 void SurfaceState::absorb(SurfaceState& next)
 {
-    if (next.committed & BufferField)
+    if (next.committed & BufferField) {
         buffer = std::move(next.buffer);
+        hasBuffer = next.hasBuffer;
+        bufferSize = next.bufferSize;
+    }
     if (next.committed & OffsetField)
         offset = offset + next.offset;
     if (next.committed & DamageField) {
@@ -106,13 +109,18 @@ Surface::~Surface()
 
 Size Surface::size() const
 {
-    const auto* b = buffer();
-    if (!b)
+    if (!m_current.hasBuffer)
         return {};
-    Size s = b->size();
+    Size s = m_current.bufferSize;
     if (isRotated90(m_current.transform))
         std::swap(s.width, s.height);
     return {s.width / m_current.scale, s.height / m_current.scale};
+}
+
+void Surface::clearDamage()
+{
+    m_current.surfaceDamage.clear();
+    m_current.bufferDamage.clear();
 }
 
 Point Surface::takeOffset()
@@ -165,6 +173,8 @@ void Surface::handleAttach(wl_resource* buffer, std::int32_t x, std::int32_t y)
             log::warn("proto", "wl_surface.attach: unsupported buffer type, ignoring");
     }
     m_pending.buffer = BufferLock(cb);
+    m_pending.hasBuffer = cb != nullptr;
+    m_pending.bufferSize = cb ? cb->size() : Size{};
     m_pending.committed |= SurfaceState::BufferField;
 }
 

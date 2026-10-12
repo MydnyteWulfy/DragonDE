@@ -3,16 +3,16 @@
 #include "backend/nested/NestedBackend.h"
 #include "core/EventLoop.h"
 #include "core/Log.h"
+#include "desktop/Desktop.h"
+#include "desktop/OutputRenderer.h"
+#include "desktop/SurfaceTextures.h"
 #include "render/Gpu.h"
 
-#include <array>
-#include <chrono>
-#include <cmath>
 #include <csignal>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <string_view>
-#include <vector>
 #include <wayland-server-core.h>
 
 using namespace dragon;
@@ -66,38 +66,6 @@ std::unique_ptr<Backend> createBackend(EventLoop& loop)
     return nullptr;
 }
 
-// M0 placeholder content: a slow hue cycle, so a frozen frame loop is obvious.
-std::array<float, 4> colorAt(std::chrono::duration<float> t)
-{
-    const float h = std::fmod(t.count() / 8.0f, 1.0f) * 6.0f;
-    const float s = 0.6f, v = 0.5f;
-    const float c = v * s;
-    const float x = c * (1.0f - std::fabs(std::fmod(h, 2.0f) - 1.0f));
-    const float m = v - c;
-    const std::array<std::array<float, 3>, 6> sectors = {{
-        {c, x, 0}, {x, c, 0}, {0, c, x}, {0, x, c}, {x, 0, c}, {c, 0, x},
-    }};
-    const auto& rgb = sectors[std::size_t(h) % 6];
-    return {rgb[0] + m, rgb[1] + m, rgb[2] + m, 1.0f};
-}
-
-void renderFrame(Gpu& gpu, Output& output, std::chrono::steady_clock::time_point start)
-{
-    Swapchain* swapchain = output.swapchain();
-    if (!swapchain)
-        return;
-    SwapchainSlot* slot = swapchain->acquire();
-    if (!slot) {
-        log::debug("core", "{}: every buffer is still on screen, skipping a frame", output.name());
-        return;
-    }
-    if (!gpu.renderer().clear(*slot->image, colorAt(std::chrono::steady_clock::now() - start))) {
-        Swapchain::release(*slot);
-        return;
-    }
-    output.present(*slot);
-}
-
 } // namespace
 
 int main()
@@ -122,9 +90,13 @@ int main()
     auto sigterm = loop.addSignal(SIGTERM, quit);
 
     Server server(display.get(), loop);
+    Desktop desktop(server);
 
-    // Declared before the backend so it's destroyed after it: outputs own GPU resources.
+    // Declaration order is teardown order (reversed): renderers and textures
+    // before the GPU, the backend (outputs) before everything that renders to it.
     std::unique_ptr<Gpu> gpu;
+    std::unique_ptr<SurfaceTextures> textures;
+    std::map<Output*, std::unique_ptr<OutputRenderer>> renderers;
     auto backend = createBackend(loop);
     if (!backend)
         return EXIT_FAILURE;
@@ -135,13 +107,25 @@ int main()
         return EXIT_FAILURE;
     }
 
-    const auto start = std::chrono::steady_clock::now();
-    std::vector<Connection> frameConnections;
+    textures = std::make_unique<SurfaceTextures>(server, *gpu);
+
+    // One output for now: new windows go in the middle of the first one.
+    Connection areaFollowsMode;
     auto outputAdded = backend->outputAdded.connect([&](Output* output) {
         server.addOutput(*output);
-        frameConnections.push_back(output->frame.connect([&gpu, output, start] { renderFrame(*gpu, *output, start); }));
+        renderers.emplace(output, std::make_unique<OutputRenderer>(server, *gpu, desktop, *textures, *output));
+        if (renderers.size() == 1) {
+            auto updateArea = [&desktop, output] {
+                desktop.setArea({0, 0, output->mode().width, output->mode().height});
+            };
+            updateArea();
+            areaFollowsMode = output->modeChanged.connect(updateArea);
+        }
     });
-    auto outputRemoved = backend->outputRemoved.connect([&](Output* output) { server.removeOutput(*output); });
+    auto outputRemoved = backend->outputRemoved.connect([&](Output* output) {
+        renderers.erase(output);
+        server.removeOutput(*output);
+    });
     auto backendQuit = backend->quitRequested.connect(quit);
 
     if (!backend->start(*gpu))
@@ -162,6 +146,8 @@ int main()
         log::info("core", "{}: {} frames presented", output->name(), output->framesPresented());
     gpu->renderer().waitIdle();
     backend.reset(); // outputs go first, while the server can still drop their globals
+    renderers.clear();
+    textures.reset();
     log::info("core", "exiting");
     return EXIT_SUCCESS;
 }
