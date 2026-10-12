@@ -321,7 +321,7 @@ DragonDE/
 | # | Milestone | Done when |
 |---|-----------|-----------|
 | **M0** ✅ | Skeleton | CMake builds; `dragon-scanner` generates bindings; core loop; Vulkan device + GBM-backed render targets with validation clean; nested backend opens a window and shows a Vulkan-cleared dmabuf; headless backend renders offscreen. |
-| **M1** | First pixels from clients | Tier 0 protocols. `foot` runs inside the nested compositor via `wl_shm`. Keyboard/pointer focus, move, close, Super+Enter to spawn terminal. |
+| **M1** | First pixels from clients | Tier 0 protocols + linux-dmabuf. **kitty** (the default terminal; GPU-rendered, so it needs dmabuf) runs inside the nested compositor. Keyboard/pointer focus, move, close, Super+Enter spawns the terminal. Stages: (1) ✅ surfaces, subsurfaces, shm, wl_output, xdg_shell; (2) textured-quad renderer + shm upload; (3) linux-dmabuf v4 import; (4) wl_seat input + data device; (5) window management. |
 | **M2** | Real apps | Tier 1 + 1g. dmabuf zero-copy; damage tracking; SSD; fractional scale; multiple nested outputs. Qt, GTK4, Firefox, mpv, and a LunarEngine build all run correctly. |
 | **M3** | Bare metal | DRM backend with libseat; launch from TTY; VT switching; hotplug; cursor plane; frame scheduling; VRR. SDDM session entry. |
 | **M4** | Desktop shell | Tier 2. Panel, launcher, notifications, wallpaper, lock screen, OSD. First "daily drive for an evening" test. |
@@ -332,7 +332,7 @@ DragonDE/
 Testing throughout:
 - Headless backend plus a small test client library for protocol-level
   integration tests (create surface → commit buffer → assert scene).
-- An app compatibility checklist run per milestone: foot, gtk4-demo,
+- An app compatibility checklist run per milestone: kitty, foot, gtk4-demo,
   Qt widgets/QML, Firefox, Chromium (Ozone Wayland), mpv, LunarEngine, Steam.
 - ASan/UBSan builds by default in debug.
 

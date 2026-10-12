@@ -4,16 +4,15 @@ A Wayland desktop environment written from scratch in C++23: own compositor
 (no wlroots), Vulkan renderer, Qt Quick shell. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
-**Status:** M0 (skeleton) complete. The compositor opens a window inside your
-current Wayland session and renders into it with Vulkan; it doesn't accept
-clients yet.
+**Status:** M0 complete; M1 in progress (stage 1 of 5: core client protocols).
+Clients can connect and create windows, but nothing is drawn or interactive yet.
 
 ## Build
 
 Arch Linux packages:
 
 ```sh
-sudo pacman -S cmake ninja gcc pugixml gtest wayland wayland-protocols libdrm mesa \
+sudo pacman -S cmake ninja gcc pugixml gtest wayland wayland-protocols libdrm mesa pixman \
     vulkan-icd-loader vulkan-headers vulkan-validation-layers
 ```
 
@@ -44,8 +43,9 @@ it or press Ctrl+C to quit.
 
 | Path | What |
 |------|------|
-| `compositor/core` | Event loop, signals, logging |
+| `compositor/core` | Event loop, signals, logging, geometry/regions |
 | `compositor/wayland` | Protocol object model (`Resource`, `Global`) |
+| `compositor/protocols` | Protocol implementations: surfaces, subsurfaces, buffers, outputs, xdg-shell |
 | `compositor/render` | GBM allocation, dma-buf sync, swapchains, Vulkan renderer |
 | `compositor/backend` | Nested (window in a parent compositor) and headless backends |
 | `tools/scanner` | `dragon-scanner`: protocol XML → C++ |

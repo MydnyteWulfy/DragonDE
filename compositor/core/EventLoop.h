@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <vector>
 
 #include "core/Signal.h"
 
@@ -45,7 +46,11 @@ private:
 // the wl_display; every fd (libinput, DRM, parent Wayland, D-Bus) goes here.
 class EventLoop {
 public:
-    explicit EventLoop(wl_event_loop* loop) : m_loop(loop) {}
+    explicit EventLoop(wl_event_loop* loop);
+    // Cancels idle callbacks that never ran. Destroy before the wl_event_loop.
+    ~EventLoop();
+    EventLoop(const EventLoop&) = delete;
+    EventLoop& operator=(const EventLoop&) = delete;
 
     wl_event_loop* handle() const { return m_loop; }
 
@@ -67,7 +72,11 @@ public:
     Signal<> beforeSleep;
 
 private:
+    struct Idle;
+    friend void idleTrampoline(void* data);
+
     wl_event_loop* m_loop;
+    std::vector<std::unique_ptr<Idle>> m_idles;
 };
 
 } // namespace dragon

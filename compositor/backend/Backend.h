@@ -15,6 +15,14 @@ namespace dragon {
 
 class Gpu;
 
+struct OutputMode {
+    std::int32_t width = 0;  // pixels
+    std::int32_t height = 0;
+    std::int32_t refreshMhz = 60000;
+
+    friend bool operator==(const OutputMode&, const OutputMode&) = default;
+};
+
 // Something we display frames on: a monitor (DRM), a window (nested), or
 // nothing at all (headless). Owns its swapchain.
 class Output {
@@ -25,6 +33,10 @@ public:
     Output& operator=(const Output&) = delete;
 
     const std::string& name() const { return m_name; }
+    // Human-readable, e.g. "DragonDE nested window".
+    virtual std::string description() const { return m_name; }
+
+    const OutputMode& mode() const { return m_mode; }
 
     // Null until the backend knows the output's size (e.g. first configure).
     Swapchain* swapchain() const { return m_swapchain.get(); }
@@ -37,13 +49,23 @@ public:
 
     // Now is a good time to render a new frame (vblank, frame callback, timer).
     Signal<> frame;
+    Signal<> modeChanged;
 
 protected:
+    void setMode(OutputMode mode)
+    {
+        if (mode == m_mode)
+            return;
+        m_mode = mode;
+        modeChanged.emit();
+    }
+
     std::unique_ptr<Swapchain> m_swapchain;
     std::uint64_t m_framesPresented = 0;
 
 private:
     std::string m_name;
+    OutputMode m_mode;
 };
 
 // Where outputs (and later input devices) come from.

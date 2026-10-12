@@ -2,6 +2,7 @@
 
 #include "core/Log.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <utility>
@@ -35,14 +36,30 @@ int signalTrampoline(int, void* data)
     return timerTrampoline(data);
 }
 
+} // namespace
+
+struct EventLoop::Idle {
+    EventLoop* loop;
+    wl_event_source* source = nullptr;
+    std::function<void()> fn;
+};
+
 void idleTrampoline(void* data)
 {
-    // Idle sources are removed by libwayland after firing; we own the callback.
-    std::unique_ptr<std::function<void()>> fn(static_cast<std::function<void()>*>(data));
-    (*fn)();
+    // libwayland removes the source after this returns; forget it first, then run.
+    auto* idle = static_cast<EventLoop::Idle*>(data);
+    auto fn = std::move(idle->fn);
+    std::erase_if(idle->loop->m_idles, [idle](const auto& p) { return p.get() == idle; });
+    fn();
 }
 
-} // namespace
+EventLoop::EventLoop(wl_event_loop* loop) : m_loop(loop) {}
+
+EventLoop::~EventLoop()
+{
+    for (auto& idle : m_idles)
+        wl_event_source_remove(idle->source);
+}
 
 EventSource::EventSource() noexcept = default;
 
@@ -110,11 +127,13 @@ EventSource EventLoop::addSignal(int signo, std::function<void()> cb)
 
 void EventLoop::addIdle(std::function<void()> cb)
 {
-    auto* fn = new std::function<void()>(std::move(cb));
-    if (!wl_event_loop_add_idle(m_loop, idleTrampoline, fn)) {
-        delete fn;
+    auto idle = std::make_unique<Idle>(Idle{this, nullptr, std::move(cb)});
+    idle->source = wl_event_loop_add_idle(m_loop, idleTrampoline, idle.get());
+    if (!idle->source) {
         log::error("core", "wl_event_loop_add_idle failed");
+        return;
     }
+    m_idles.push_back(std::move(idle));
 }
 
 int EventLoop::dispatch(int timeoutMs)

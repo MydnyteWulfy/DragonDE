@@ -20,6 +20,7 @@ public:
     };
 
     HeadlessBackend(EventLoop& loop, Config config) : m_loop(loop), m_config(config) {}
+    ~HeadlessBackend() override { clearOutputs(); }
 
     const char* name() const override { return "headless"; }
     bool start(Gpu& gpu) override;

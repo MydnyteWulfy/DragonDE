@@ -199,6 +199,8 @@ public:
         wl_surface_commit(m_surface); // no buffer yet: asks for the first configure
     }
 
+    std::string description() const override { return "DragonDE nested window " + name(); }
+
     void present(SwapchainSlot& slot) override
     {
         wl_surface_attach(m_surface, m_buffers[slot.index], 0, 0);
@@ -268,6 +270,8 @@ private:
             m_buffers.push_back(wlBuffer);
         }
         log::debug("backend", "nested: {} resized to {}x{}", name(), width, height);
+        // We can't know the parent's refresh rate here; frame callbacks pace us anyway.
+        setMode({std::int32_t(width), std::int32_t(height), 60000});
         return true;
     }
 

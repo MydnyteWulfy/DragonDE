@@ -1,3 +1,4 @@
+#include "Server.h"
 #include "backend/headless/HeadlessBackend.h"
 #include "backend/nested/NestedBackend.h"
 #include "core/EventLoop.h"
@@ -119,7 +120,8 @@ int main()
     };
     auto sigint = loop.addSignal(SIGINT, quit);
     auto sigterm = loop.addSignal(SIGTERM, quit);
-    auto flushClients = loop.beforeSleep.connect([&] { wl_display_flush_clients(display.get()); });
+
+    Server server(display.get(), loop);
 
     // Declared before the backend so it's destroyed after it: outputs own GPU resources.
     std::unique_ptr<Gpu> gpu;
@@ -136,8 +138,10 @@ int main()
     const auto start = std::chrono::steady_clock::now();
     std::vector<Connection> frameConnections;
     auto outputAdded = backend->outputAdded.connect([&](Output* output) {
+        server.addOutput(*output);
         frameConnections.push_back(output->frame.connect([&gpu, output, start] { renderFrame(*gpu, *output, start); }));
     });
+    auto outputRemoved = backend->outputRemoved.connect([&](Output* output) { server.removeOutput(*output); });
     auto backendQuit = backend->quitRequested.connect(quit);
 
     if (!backend->start(*gpu))
@@ -157,6 +161,7 @@ int main()
     for (const auto& output : backend->outputs())
         log::info("core", "{}: {} frames presented", output->name(), output->framesPresented());
     gpu->renderer().waitIdle();
+    backend.reset(); // outputs go first, while the server can still drop their globals
     log::info("core", "exiting");
     return EXIT_SUCCESS;
 }

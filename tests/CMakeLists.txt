@@ -6,10 +6,12 @@ add_executable(dragon-tests
     wayland/ProtocolTest.cpp
     render/VulkanClearTest.cpp
     backend/HeadlessBackendTest.cpp
+    server/SurfaceTest.cpp
+    server/XdgShellTest.cpp
 )
 target_link_libraries(dragon-tests PRIVATE
     dragon_wayland
-    dragon_backend
+    dragon_server
     PkgConfig::WaylandClient
     dragon::options
     GTest::gtest_main

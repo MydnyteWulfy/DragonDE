@@ -16,9 +16,10 @@ namespace {
 class HeadlessOutput final : public Output {
 public:
     HeadlessOutput(EventLoop& loop, std::string name, std::chrono::milliseconds period,
-                   std::unique_ptr<Swapchain> swapchain)
+                   std::unique_ptr<Swapchain> swapchain, std::int32_t refreshMhz)
         : Output(std::move(name)), m_period(period)
     {
+        setMode({std::int32_t(swapchain->width()), std::int32_t(swapchain->height()), refreshMhz});
         m_swapchain = std::move(swapchain);
         // Fixed-rate "vblank": fire, then re-arm, whether or not a frame was drawn.
         m_timer = loop.addTimer([this] {
@@ -57,7 +58,7 @@ bool HeadlessBackend::start(Gpu& gpu)
         if (!swapchain)
             return false;
         addOutput(std::make_unique<HeadlessOutput>(m_loop, std::format("HEADLESS-{}", i + 1), period,
-                                                   std::move(swapchain)));
+                                                   std::move(swapchain), std::int32_t(m_config.refreshHz * 1000)));
     }
     return true;
 }

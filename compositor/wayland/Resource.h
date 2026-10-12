@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <format>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 struct wl_client;
@@ -40,11 +41,13 @@ public:
     // for it and get disconnected with "invalid object"; make it inert instead.
     void destroy();
 
-    // Sends a protocol error; the client will be disconnected.
-    template <typename... Args>
-    void postError(std::uint32_t code, std::format_string<Args...> fmt, Args&&... args)
+    // Sends a protocol error; the client will be disconnected. `code` is the
+    // interface's error enum (e.g. proto::XdgSurfaceError::InvalidSerial).
+    template <typename Code, typename... Args>
+        requires(std::is_enum_v<Code> || std::is_integral_v<Code>)
+    void postError(Code code, std::format_string<Args...> fmt, Args&&... args)
     {
-        postErrorString(code, std::format(fmt, std::forward<Args>(args)...));
+        postErrorString(static_cast<std::uint32_t>(code), std::format(fmt, std::forward<Args>(args)...));
     }
 
     // Emitted from ~Resource. Derived parts are already gone, so listeners may

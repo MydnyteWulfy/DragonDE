@@ -2,9 +2,11 @@ add_library(dragon_core STATIC
     core/EventLoop.cpp
     core/Log.cpp
 )
+pkg_check_modules(Pixman REQUIRED IMPORTED_TARGET pixman-1)
+
 target_include_directories(dragon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(dragon_core
-    PUBLIC PkgConfig::WaylandServer
+    PUBLIC PkgConfig::WaylandServer PkgConfig::Pixman
     PRIVATE dragon::options
 )
 
@@ -62,5 +64,18 @@ dragon_add_client_protocol(dragon_backend ${WAYLAND_PROTOCOLS_DIR}/stable/linux-
 dragon_add_client_protocol(dragon_backend
     ${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml)
 
+# Server side: protocol implementations and the globals that expose them.
+add_library(dragon_server STATIC
+    Server.cpp
+    protocols/Buffer.cpp
+    protocols/Compositor.cpp
+    protocols/Output.cpp
+    protocols/XdgShell.cpp
+)
+target_link_libraries(dragon_server
+    PUBLIC dragon_wayland dragon_backend
+    PRIVATE dragon::options
+)
+
 add_executable(dragon-compositor main.cpp)
-target_link_libraries(dragon-compositor PRIVATE dragon_backend dragon_wayland dragon::options)
+target_link_libraries(dragon-compositor PRIVATE dragon_server dragon::options)
