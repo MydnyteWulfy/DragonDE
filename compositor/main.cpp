@@ -14,6 +14,7 @@
 
 #include <csignal>
 #include <cstdlib>
+#include <format>
 #include <map>
 #include <memory>
 #include <string_view>
@@ -154,6 +155,15 @@ int main()
                       {.quit = quit, .spawn = [](const std::string& cmd) { process::spawn(cmd); }});
     auto reap = loop.addSignal(SIGCHLD, [] { process::reapChildren(); });
 
+    // `kill -USR1 <pid>`: save the next frame of every output as a PNG.
+    int screenshots = 0;
+    auto screenshot = loop.addSignal(SIGUSR1, [&] {
+        const auto dir = env("DRAGON_SCREENSHOT_DIR").empty() ? std::string("/tmp") : std::string(env("DRAGON_SCREENSHOT_DIR"));
+        ++screenshots;
+        for (auto& [output, renderer] : renderers)
+            renderer->screenshot(std::format("{}/dragon-{}-{}.png", dir, output->name(), screenshots));
+    });
+
     if (!backend->start(*gpu))
         return EXIT_FAILURE;
 
@@ -168,6 +178,9 @@ int main()
     // connected to its parent, so changing our own environment is safe now.)
     setenv("WAYLAND_DISPLAY", socket, 1);
     unsetenv("WAYLAND_SOCKET");
+    // No XWayland yet: without this, X11-capable apps would open on the
+    // parent session's X server instead of failing or using Wayland.
+    unsetenv("DISPLAY");
 
     while (running)
         loop.dispatch(-1);

@@ -5,6 +5,7 @@
 #include "render/vulkan/VulkanRenderer.h"
 
 #include <array>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -28,7 +29,13 @@ public:
 
     static constexpr std::array<float, 4> kBackground{0.08f, 0.09f, 0.12f, 1.0f};
 
+    // Saves the next frame as a PNG (debugging aid; renders it a second time
+    // into a CPU-readable buffer).
+    void screenshot(std::string path) { m_screenshotPath = std::move(path); }
+
 private:
+    void saveScreenshot();
+
     void render();
     // Adds `surface` and its subsurfaces, in stacking order, with `origin` as its top-left.
     void collect(Surface* surface, Point origin);
@@ -44,6 +51,7 @@ private:
     std::vector<vk::TextureDraw> m_draws;
     std::vector<Surface*> m_drawn;
     std::unordered_map<Surface*, Connection> m_entered; // surfaces that got wl_surface.enter
+    std::string m_screenshotPath;
 };
 
 } // namespace dragon

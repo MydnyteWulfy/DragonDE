@@ -3,13 +3,19 @@
 #include "Server.h"
 #include "backend/Backend.h"
 #include "core/Log.h"
+#include "core/Png.h"
 #include "desktop/Desktop.h"
 #include "desktop/SurfaceTextures.h"
 #include "protocols/Compositor.h"
 #include "protocols/Output.h"
 #include "render/Gpu.h"
+#include "render/vulkan/VulkanImage.h"
 
 #include <chrono>
+#include <drm_fourcc.h>
+#include <gbm.h>
+#include <utility>
+#include <vector>
 
 namespace dragon {
 
@@ -42,6 +48,8 @@ void OutputRenderer::render()
         return;
     }
     m_output.present(*slot);
+    if (!m_screenshotPath.empty())
+        saveScreenshot();
 
     // Everything we drew may draw its next frame now.
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -50,6 +58,46 @@ void OutputRenderer::render()
         enter(s);
         s->sendFrameDone(msec);
     }
+}
+
+void OutputRenderer::saveScreenshot()
+{
+    const std::string path = std::exchange(m_screenshotPath, {});
+    const auto& mode = m_output.mode();
+    const std::uint64_t linear = DRM_FORMAT_MOD_LINEAR;
+    auto buffer = m_gpu.allocator().allocate(std::uint32_t(mode.width), std::uint32_t(mode.height),
+                                             DRM_FORMAT_XRGB8888, {&linear, 1}, GBM_BO_USE_RENDERING);
+    auto image = buffer ? vk::VulkanImage::importDmaBuf(m_gpu.vulkan(), buffer->dmabuf(),
+                                                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, "screenshot")
+                        : nullptr;
+    if (!image || !m_gpu.renderer().render(*image, kBackground, m_draws) || !m_gpu.renderer().waitIdle()) {
+        log::error("render", "screenshot failed");
+        return;
+    }
+
+    std::uint32_t stride = 0;
+    void* mapData = nullptr;
+    const auto w = std::uint32_t(mode.width), h = std::uint32_t(mode.height);
+    auto* base = static_cast<const std::uint8_t*>(
+        gbm_bo_map(buffer->bo(), 0, 0, w, h, GBM_BO_TRANSFER_READ, &stride, &mapData));
+    if (!base) {
+        log::error("render", "screenshot: cannot map buffer");
+        return;
+    }
+    std::vector<std::uint8_t> rgb(std::size_t(w) * h * 3);
+    for (std::uint32_t y = 0; y < h; ++y) {
+        for (std::uint32_t x = 0; x < w; ++x) {
+            const std::uint8_t* px = base + std::size_t(y) * stride + std::size_t(x) * 4; // B G R X
+            std::uint8_t* out = &rgb[(std::size_t(y) * w + x) * 3];
+            out[0] = px[2], out[1] = px[1], out[2] = px[0];
+        }
+    }
+    gbm_bo_unmap(buffer->bo(), mapData);
+
+    if (png::writeRgb(path, w, h, rgb))
+        log::info("render", "screenshot saved to {}", path);
+    else
+        log::error("render", "cannot write {}", path);
 }
 
 void OutputRenderer::collect(Surface* surface, Point origin)

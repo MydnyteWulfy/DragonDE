@@ -111,6 +111,7 @@ void Desktop::unmapWindow(XdgToplevel* toplevel)
         return;
     auto window = std::move(*it);
     m_windows.erase(it);
+    log::debug("desktop", "unmapped '{}'", toplevel->title());
     windowUnmapped.emit(window.get());
     if (m_focused == window.get()) {
         m_focused = nullptr;
