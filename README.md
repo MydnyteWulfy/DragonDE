@@ -4,10 +4,11 @@ A Wayland desktop environment written from scratch in C++23: own compositor
 (no wlroots), Vulkan renderer, Qt Quick shell. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
-**Status:** M0 and M1 complete. Inside a nested window, apps such as kitty
-and foot run with GPU rendering (zero-copy dma-buf), keyboard and mouse input,
-click-to-focus, copy/paste, moving, resizing and maximizing. Next up (M2):
-broader app compatibility (cursors, scaling, more protocols).
+**Status:** M0 and M1 complete; working toward everyday apps. Firefox and
+VS Code (Electron, `--ozone-platform=wayland`) run inside the nested session
+with GPU rendering, input, menus, copy/paste and middle-click paste, cursor
+shapes, focus activation and portal file dialogs. No XWayland yet, so
+X11-only apps don't run.
 
 ## Build
 
@@ -41,6 +42,10 @@ WAYLAND_DISPLAY=wayland-1 foot
 WAYLAND_DISPLAY=wayland-1 ./build/debug/tools/demo-client/dragon-demo-client
 ```
 
+Apps started inside DragonDE (e.g. from a terminal opened with `Mod+Enter`)
+inherit its environment: Wayland socket, desktop name and private D-Bus
+session. Electron apps need `--ozone-platform=wayland` until XWayland exists.
+
 Close the window or press Ctrl+C to quit.
 
 ### Shortcuts
@@ -67,6 +72,8 @@ resized and maximized from those.
 | `DRAGON_VK_VALIDATION` | `0`, `1` | on in Debug builds |
 | `DRAGON_MOD` | `super`, `alt`, `ctrl` | `super`; `alt` when nested |
 | `DRAGON_TERMINAL` | any shell command | `kitty` |
+| `DRAGON_PRIVATE_BUS` | `0`, `1` | `1` when nested: apps get their own D-Bus session so portals (file dialogs) open inside DragonDE |
+| `DRAGON_SCREENSHOT_DIR` | directory | `/tmp`; `kill -USR1 <pid>` saves each output as PNG |
 
 ## Layout
 

@@ -104,3 +104,18 @@ TEST(Process, SpawnRunsAShellCommand)
     EXPECT_TRUE(std::filesystem::exists(marker));
     std::filesystem::remove(marker);
 }
+
+#include "core/SessionBus.h"
+
+TEST(SessionBus, StartsAPrivateBusThatAnswers)
+{
+    auto bus = dragon::SessionBus::start();
+    if (!bus) {
+        GTEST_SKIP() << "dbus-daemon not available";
+    }
+    EXPECT_TRUE(bus->address().starts_with("unix:")) << bus->address();
+
+    const std::string cmd = "dbus-send --bus='" + bus->address() +
+                            "' --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.GetId >/dev/null 2>&1";
+    EXPECT_EQ(std::system(cmd.c_str()), 0) << "the bus doesn't answer";
+}

@@ -158,6 +158,22 @@ void InputRouter::button(std::uint32_t button, bool pressed, std::uint32_t timeM
     if (!pressed && m_swallowedButtons.erase(button))
         return;
 
+    // Menus open: a click outside their client closes them and goes nowhere
+    // else; a click inside goes to the client without changing focus.
+    if (pressed && !m_seat.buttonsPressed() && m_desktop.popupGrabActive()) {
+        const auto hit = m_desktop.surfaceAt(m_pointer);
+        if (!hit.surface || hit.surface->client() != m_desktop.popupGrabClient()) {
+            m_desktop.dismissPopups();
+            m_swallowedButtons.insert(button);
+            return;
+        }
+        if (hit.surface != m_seat.pointerFocus())
+            m_seat.notifyPointerFocus(hit.surface, hit.local);
+        m_lastClientButton = button;
+        m_seat.notifyButton(timeMs, button, pressed);
+        return;
+    }
+
     if (pressed && !m_seat.buttonsPressed()) {
         const auto hit = m_desktop.surfaceAt(m_pointer);
         Desktop::Window* window = hit.surface ? m_desktop.windowOf(hit.surface) : nullptr;

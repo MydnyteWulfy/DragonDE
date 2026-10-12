@@ -49,6 +49,7 @@ struct ClientWindow {
     std::vector<std::uint32_t> states;
     bool sawCapabilities = false;
     bool closed = false;
+    Size bounds;
 
     bool hasState(xdg_toplevel_state s) const { return std::ranges::find(states, std::uint32_t(s)) != states.end(); }
 };
@@ -273,7 +274,9 @@ private:
                 w->states.assign(s, s + states->size / sizeof(std::uint32_t));
             },
         .close = [](void* data, xdg_toplevel*) { static_cast<ClientWindow*>(data)->closed = true; },
-        .configure_bounds = [](void*, xdg_toplevel*, std::int32_t, std::int32_t) {},
+        .configure_bounds = [](void* data, xdg_toplevel*, std::int32_t w, std::int32_t h) {
+            static_cast<ClientWindow*>(data)->bounds = {w, h};
+        },
         .wm_capabilities = [](void* data, xdg_toplevel*, wl_array*) {
             static_cast<ClientWindow*>(data)->sawCapabilities = true;
         },

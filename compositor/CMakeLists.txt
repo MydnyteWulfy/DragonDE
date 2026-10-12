@@ -3,10 +3,13 @@ add_library(dragon_core STATIC
     core/Log.cpp
     core/Png.cpp
     core/Process.cpp
+    core/SessionBus.cpp
 )
 pkg_check_modules(Pixman REQUIRED IMPORTED_TARGET pixman-1)
 
 target_include_directories(dragon_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Where data files (portal config, ...) live; an install prefix replaces this later.
+target_compile_definitions(dragon_core PUBLIC DRAGON_DATA_DIR="${PROJECT_SOURCE_DIR}/data")
 target_link_libraries(dragon_core
     PUBLIC PkgConfig::WaylandServer PkgConfig::Pixman
     PRIVATE dragon::options
@@ -27,6 +30,10 @@ target_link_libraries(dragon_wayland PUBLIC dragon_core dragon_protocol_tables P
 dragon_add_protocol(dragon_wayland ${WAYLAND_XML_DIR}/wayland.xml CORE SKIP wl_display wl_registry)
 dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
 dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/stable/linux-dmabuf/linux-dmabuf-v1.xml)
+dragon_add_protocol(dragon_wayland
+    ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml)
+dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/staging/xdg-activation/xdg-activation-v1.xml)
+dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/staging/cursor-shape/cursor-shape-v1.xml)
 
 # GPU: render node, GBM allocation, dma-buf sync, swapchains, Vulkan renderer.
 find_package(Vulkan REQUIRED)
@@ -68,6 +75,9 @@ dragon_add_client_protocol(dragon_client_protocols
     ${WAYLAND_PROTOCOLS_DIR}/staging/cursor-shape/cursor-shape-v1.xml)
 # cursor-shape references zwp_tablet_tool_v2, so its tables must exist too.
 dragon_add_client_protocol(dragon_client_protocols ${WAYLAND_PROTOCOLS_DIR}/stable/tablet/tablet-v2.xml)
+dragon_add_client_protocol(dragon_client_protocols
+    ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml)
+dragon_add_client_protocol(dragon_client_protocols ${WAYLAND_PROTOCOLS_DIR}/staging/xdg-activation/xdg-activation-v1.xml)
 
 # Backends: where outputs and input come from.
 add_library(dragon_backend STATIC
@@ -85,10 +95,12 @@ add_library(dragon_server STATIC
     Server.cpp
     protocols/Buffer.cpp
     protocols/Compositor.cpp
+    protocols/CursorShape.cpp
     protocols/DataDevice.cpp
     protocols/LinuxDmabuf.cpp
     protocols/Output.cpp
     protocols/Seat.cpp
+    protocols/XdgActivation.cpp
     protocols/XdgShell.cpp
 )
 pkg_check_modules(XkbCommon REQUIRED IMPORTED_TARGET xkbcommon)

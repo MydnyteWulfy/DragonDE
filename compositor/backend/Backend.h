@@ -129,6 +129,10 @@ public:
     // Creates the initial outputs (emitting outputAdded for each).
     virtual bool start(Gpu& gpu) = 0;
 
+    // Cursor to show, as a wp_cursor_shape_device_v1 shape (0: hidden). Backends
+    // with a hardware/host cursor apply it; others ignore it.
+    virtual void setCursorShape(std::uint32_t /*shape*/) {}
+
     std::span<const std::unique_ptr<Output>> outputs() const { return m_outputs; }
 
     Signal<Output*> outputAdded;

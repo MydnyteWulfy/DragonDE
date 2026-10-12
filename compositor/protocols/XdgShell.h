@@ -30,9 +30,13 @@ struct PositionerState {
     bool reactive = false;
 
     bool complete() const { return hasSize && hasAnchorRect; }
-    // Popup rectangle relative to the parent's window geometry. Constraint
-    // adjustment (keeping popups on screen) comes with the scene graph.
-    Rect place() const;
+    // Popup rectangle relative to the parent's window geometry. With `bounds`
+    // (the usable area, in the same coordinates) the constraint adjustments
+    // the client allowed are applied: flip, then slide, then resize, per axis.
+    Rect place(std::optional<Rect> bounds = std::nullopt) const;
+
+private:
+    Rect unconstrained(bool flipX, bool flipY) const;
 };
 
 class XdgPositioner final : public proto::XdgPositioner {
@@ -186,6 +190,10 @@ public:
     // The last configure the client acked.
     const Configure& currentConfigure() const { return m_current; }
 
+    // The largest size that makes sense (the usable area): clients use it to
+    // pick their initial size. Sent with configures (xdg_toplevel v4+).
+    void setBounds(Size bounds);
+
     // Asks the client to close (it may refuse or ask the user first).
     void requestClose() { sendClose(); }
 
@@ -233,6 +241,8 @@ private:
     Configure m_current;
     std::vector<std::pair<std::uint32_t, Configure>> m_inflight;
     bool m_sentCapabilities = false;
+    Size m_bounds;
+    bool m_boundsChanged = false;
 };
 
 class XdgPopup final : public proto::XdgPopup, public XdgRole {
@@ -248,9 +258,15 @@ public:
 
     // Tells the client the popup was dismissed (click outside, parent gone, ...).
     void dismiss();
+    bool dismissed() const { return m_dismissed; }
+
+    // The client asked for an explicit grab (menus): keyboard focus and
+    // dismissal on clicks outside it. `grabSerial` is the input event it quoted.
+    bool wantsGrab() const { return m_grabSerial.has_value(); }
+    std::uint32_t grabSerial() const { return m_grabSerial.value_or(0); }
 
 protected:
-    void handleGrab(wl_resource*, std::uint32_t) override {}
+    void handleGrab(wl_resource* seat, std::uint32_t serial) override;
     void handleReposition(wl_resource* positioner, std::uint32_t token) override;
 
 private:
@@ -262,6 +278,7 @@ private:
     XdgSurface* m_parent;
     Rect m_geometry;
     std::optional<std::uint32_t> m_repositionToken;
+    std::optional<std::uint32_t> m_grabSerial;
     bool m_dismissed = false;
     Connection m_parentDying;
 };

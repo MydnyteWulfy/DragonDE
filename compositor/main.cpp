@@ -4,10 +4,13 @@
 #include "core/EventLoop.h"
 #include "core/Log.h"
 #include "core/Process.h"
+#include "core/SessionBus.h"
 #include "desktop/Desktop.h"
 #include "desktop/InputRouter.h"
 #include "desktop/OutputRenderer.h"
 #include "desktop/SurfaceTextures.h"
+#include "protocols/Seat.h"
+#include "protocols/XdgActivation.h"
 #include "protocols/LinuxDmabuf.h"
 #include "render/Gpu.h"
 #include "render/vulkan/VulkanTexture.h"
@@ -140,6 +143,7 @@ int main()
         server.removeOutput(*output);
     });
     auto backendQuit = backend->quitRequested.connect(quit);
+    auto cursor = server.seat().cursorShapeChanged.connect([&](std::uint32_t shape) { backend->setCursorShape(shape); });
     // Shortcut modifier: Super, except nested where the parent compositor
     // usually keeps Super shortcuts (like Super+drag) for itself.
     WindowManagerConfig wm;
@@ -152,7 +156,11 @@ int main()
     if (const auto terminal = env("DRAGON_TERMINAL"); !terminal.empty())
         wm.terminal = terminal;
     InputRouter input(*backend, desktop, server.seat(), wm,
-                      {.quit = quit, .spawn = [](const std::string& cmd) { process::spawn(cmd); }});
+                      {.quit = quit, .spawn = [&server](const std::string& cmd) {
+                           // A launch token lets the app take focus once it shows up, however slowly.
+                           const auto token = server.activation().createCompositorToken();
+                           process::spawn(cmd, {"XDG_ACTIVATION_TOKEN=" + token, "DESKTOP_STARTUP_ID=" + token});
+                       }});
     auto reap = loop.addSignal(SIGCHLD, [] { process::reapChildren(); });
 
     // `kill -USR1 <pid>`: save the next frame of every output as a PNG.
@@ -181,6 +189,23 @@ int main()
     // No XWayland yet: without this, X11-capable apps would open on the
     // parent session's X server instead of failing or using Wayland.
     unsetenv("DISPLAY");
+    // Apps pick portal backends, themes and quirks by desktop name.
+    setenv("XDG_CURRENT_DESKTOP", "DragonDE", 1);
+    setenv("XDG_SESSION_DESKTOP", "DragonDE", 1);
+    const std::string configDirs = env("XDG_CONFIG_DIRS").empty() ? "/etc/xdg" : std::string(env("XDG_CONFIG_DIRS"));
+    setenv("XDG_CONFIG_DIRS", (std::string(DRAGON_DATA_DIR) + ":" + configDirs).c_str(), 1); // dragonde-portals.conf
+
+    // Nested, the parent's session bus would start portals in the parent
+    // (file choosers opening on the outer desktop). Give our apps their own
+    // bus, started now so activated services inherit the environment above.
+    // On real hardware dragon-session provides the bus.
+    std::unique_ptr<SessionBus> sessionBus;
+    const auto privateBus = env("DRAGON_PRIVATE_BUS");
+    if (privateBus == "1" || (privateBus.empty() && nested)) {
+        sessionBus = SessionBus::start();
+        if (sessionBus)
+            setenv("DBUS_SESSION_BUS_ADDRESS", sessionBus->address().c_str(), 1);
+    }
 
     while (running)
         loop.dispatch(-1);

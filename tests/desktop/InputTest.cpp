@@ -8,6 +8,12 @@
 #include "protocols/Seat.h"
 #include "protocols/XdgShell.h"
 
+#include "protocols/XdgActivation.h"
+
+#include "cursor-shape-v1-client-protocol.h"
+#include "primary-selection-unstable-v1-client-protocol.h"
+#include "xdg-activation-v1-client-protocol.h"
+
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
 #include <string>
@@ -29,6 +35,8 @@ struct ClientInput {
     wl_surface* keyboardSurface = nullptr;
     PointF pointer;
     std::uint32_t lastButtonSerial = 0;
+    std::uint32_t lastKeySerial = 0;
+    std::uint32_t enterSerial = 0;
     std::uint32_t modsDepressed = 0;
     std::string keymap;
     std::int32_t repeatRate = 0, repeatDelay = 0;
@@ -126,8 +134,9 @@ protected:
 
     static constexpr wl_pointer_listener kPointerListener = {
         .enter =
-            [](void* d, wl_pointer*, std::uint32_t, wl_surface* s, wl_fixed_t x, wl_fixed_t y) {
+            [](void* d, wl_pointer*, std::uint32_t serial, wl_surface* s, wl_fixed_t x, wl_fixed_t y) {
                 auto* in = static_cast<ClientInput*>(d);
+                in->enterSerial = serial;
                 in->pointerSurface = s;
                 in->pointer = {wl_fixed_to_double(x), wl_fixed_to_double(y)};
                 in->add("enter");
@@ -187,7 +196,8 @@ protected:
                 in->keyboardSurface = nullptr;
                 in->add("kb-leave");
             },
-        .key = [](void* d, wl_keyboard*, std::uint32_t, std::uint32_t, std::uint32_t key, std::uint32_t state) {
+        .key = [](void* d, wl_keyboard*, std::uint32_t serial, std::uint32_t, std::uint32_t key, std::uint32_t state) {
+            static_cast<ClientInput*>(d)->lastKeySerial = serial;
             static_cast<ClientInput*>(d)->add(std::format("key {} {}", key, state));
         },
         .modifiers = [](void* d, wl_keyboard*, std::uint32_t, std::uint32_t depressed, std::uint32_t, std::uint32_t,
@@ -529,8 +539,364 @@ TEST_F(InputTest, MaximizeFillsTheAreaAndRestores)
     EXPECT_EQ(desktop->windows()[0]->position, (Point{350, 250}));
 }
 
+TEST_F(InputTest, WindowsAreToldWhatFits)
+{
+    auto w = makeWindow();
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(w->bounds, (Size{800, 600})) << "bounds come with the very first configure";
+
+    desktop->setArea({0, 0, 1024, 768});
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(w->bounds, (Size{1024, 768}));
+}
+
+TEST_F(InputTest, OversizedWindowIsAskedToFit)
+{
+    auto w = window(1000, 900); // bigger than 800x600 (a client ignoring configure_bounds)
+    ASSERT_TRUE(roundtrip());
+
+    EXPECT_EQ(w->width, 800);
+    EXPECT_EQ(w->height, 600);
+    EXPECT_EQ(desktop->windows()[0]->position, (Point{0, 0}));
+}
+
 TEST_F(InputTest, CapabilitiesAdvertiseMaximizeAndFullscreen)
 {
     auto w = window(100, 100);
     EXPECT_TRUE(w->sawCapabilities);
+}
+
+// ------------------------------------------------------------------ popups --
+
+namespace {
+struct ClientPopup {
+    wl_surface* surface = nullptr;
+    xdg_surface* xdg = nullptr;
+    xdg_popup* popup = nullptr;
+    std::int32_t x = 0, y = 0, w = 0, h = 0;
+    std::uint32_t serial = 0;
+    bool done = false;
+};
+
+struct PopupSpec {
+    Size size{100, 50};
+    Rect anchorRect{0, 0, 10, 10};
+    std::uint32_t anchor = XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
+    std::uint32_t gravity = XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+    std::uint32_t constraints = 0;
+};
+} // namespace
+
+class PopupTest : public InputTest {
+protected:
+    // Creates a popup on `parent` and does the initial commit; `grab` asks for a grab with that serial.
+    std::unique_ptr<ClientPopup> popup(test::ClientWindow& parent, const PopupSpec& spec,
+                                       std::optional<std::uint32_t> grab = std::nullopt)
+    {
+        auto p = std::make_unique<ClientPopup>();
+        auto* positioner = xdg_wm_base_create_positioner(wmBase);
+        xdg_positioner_set_size(positioner, spec.size.width, spec.size.height);
+        xdg_positioner_set_anchor_rect(positioner, spec.anchorRect.x, spec.anchorRect.y, spec.anchorRect.width,
+                                       spec.anchorRect.height);
+        xdg_positioner_set_anchor(positioner, spec.anchor);
+        xdg_positioner_set_gravity(positioner, spec.gravity);
+        xdg_positioner_set_constraint_adjustment(positioner, spec.constraints);
+        p->surface = makeSurface();
+        p->xdg = track(xdg_wm_base_get_xdg_surface(wmBase, p->surface));
+        p->popup = track(xdg_surface_get_popup(p->xdg, parent.xdg, positioner));
+        xdg_positioner_destroy(positioner);
+        xdg_popup_add_listener(p->popup, &kPopupListener, p.get());
+        xdg_surface_add_listener(p->xdg, &kPopupSurfaceListener, p.get());
+        if (grab)
+            xdg_popup_grab(p->popup, seat, *grab);
+        wl_surface_commit(p->surface);
+        EXPECT_TRUE(roundtrip());
+        return p;
+    }
+
+    void mapPopup(ClientPopup& p)
+    {
+        xdg_surface_ack_configure(p.xdg, p.serial);
+        wl_surface_attach(p.surface, makeBuffer(p.w, p.h), 0, 0);
+        wl_surface_commit(p.surface);
+        ASSERT_TRUE(roundtrip());
+    }
+
+    static constexpr xdg_popup_listener kPopupListener = {
+        .configure = [](void* d, xdg_popup*, std::int32_t x, std::int32_t y, std::int32_t w, std::int32_t h) {
+            auto* p = static_cast<ClientPopup*>(d);
+            p->x = x, p->y = y, p->w = w, p->h = h;
+        },
+        .popup_done = [](void* d, xdg_popup*) { static_cast<ClientPopup*>(d)->done = true; },
+        .repositioned = [](void*, xdg_popup*, std::uint32_t) {},
+    };
+    static constexpr xdg_surface_listener kPopupSurfaceListener = {
+        .configure = [](void* d, xdg_surface*, std::uint32_t serial) { static_cast<ClientPopup*>(d)->serial = serial; },
+    };
+};
+
+TEST_F(PopupTest, FlipsUpWhenItWouldRunOffTheBottom)
+{
+    auto w = window(100, 100); // y 250..350 in a 600px area
+    auto p = popup(*w, {.size = {100, 300}, .anchorRect = {0, 90, 10, 10}, .constraints = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y});
+
+    // Below: 350..650 doesn't fit. Flipped above the anchor: 90-300 = -210 -> 40..340 fits.
+    EXPECT_EQ(p->y, -210);
+    EXPECT_EQ(p->h, 300);
+}
+
+TEST_F(PopupTest, SlidesLeftAtTheRightEdge)
+{
+    auto w = window(100, 100); // x 350..450 in an 800px area
+    auto p = popup(*w, {.size = {500, 50}, .anchorRect = {90, 0, 10, 10}, .anchor = XDG_POSITIONER_ANCHOR_TOP_RIGHT,
+                        .constraints = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X});
+
+    EXPECT_EQ(350 + p->x + p->w, 800) << "slid flush against the right edge";
+}
+
+TEST_F(PopupTest, UnconstrainedPopupIsLeftAlone)
+{
+    auto w = window(100, 100);
+    auto p = popup(*w, {.size = {100, 300}, .anchorRect = {0, 90, 10, 10}}); // no adjustments allowed
+    EXPECT_EQ(p->y, 100);
+}
+
+TEST_F(PopupTest, GrabbedMenuTakesKeyboardAndOutsideClickDismissesIt)
+{
+    auto w = window(100, 100); // at (350, 250)
+    move(360, 260);
+    click(BTN_RIGHT, true); // right-click opens a context menu
+    click(BTN_RIGHT, false);
+    auto p = popup(*w, {}, in.lastButtonSerial);
+    mapPopup(*p);
+    EXPECT_EQ(in.keyboardSurface, p->surface) << "the menu gets the keyboard";
+
+    in.log.clear();
+    move(50, 50); // background
+    click(BTN_LEFT, true);
+    click(BTN_LEFT, false);
+
+    EXPECT_TRUE(p->done) << "clicking outside closes the menu";
+    for (const auto& e : in.log)
+        EXPECT_FALSE(e.starts_with("button")) << "the dismissing click goes nowhere: " << e;
+    EXPECT_EQ(in.keyboardSurface, w->surface) << "keyboard back to the window";
+}
+
+TEST_F(PopupTest, ClickInsideTheSameClientKeepsTheMenu)
+{
+    auto w = window(100, 100);
+    move(360, 260);
+    click(BTN_RIGHT, true);
+    click(BTN_RIGHT, false);
+    auto p = popup(*w, {}, in.lastButtonSerial); // anchored 10px into the window: (350, 260) 100x50
+    mapPopup(*p);
+
+    move(370, 280); // on the menu
+    click(BTN_LEFT, true);
+    click(BTN_LEFT, false);
+
+    EXPECT_FALSE(p->done);
+    EXPECT_TRUE(in.saw(std::format("button {} 1", BTN_LEFT))) << "the menu gets the click";
+}
+
+TEST_F(PopupTest, GrabWithoutRealInputIsRefused)
+{
+    auto w = window(100, 100);
+    auto p = popup(*w, {}, 12345u); // made-up serial
+    mapPopup(*p);
+
+    EXPECT_TRUE(p->done);
+    EXPECT_EQ(in.keyboardSurface, w->surface);
+}
+
+TEST_F(PopupTest, GrabAfterMapIsAProtocolError)
+{
+    auto w = window(100, 100);
+    auto p = popup(*w, {});
+    mapPopup(*p);
+    xdg_popup_grab(p->popup, seat, 1);
+
+    EXPECT_FALSE(roundtrip());
+    EXPECT_EQ(protocolError(), (std::pair<std::string, std::uint32_t>{"xdg_popup", XDG_POPUP_ERROR_INVALID_GRAB}));
+}
+
+// -------------------------------------------- primary selection, cursors, activation --
+
+namespace {
+// Binds one global by interface name.
+template <typename T>
+T* bindGlobal(test::ServerFixture& f, const wl_interface* iface, std::uint32_t version)
+{
+    struct Ctx {
+        const wl_interface* iface;
+        std::uint32_t version;
+        void* bound = nullptr;
+    } ctx{iface, version};
+    static const wl_registry_listener listener = {
+        .global =
+            [](void* d, wl_registry* reg, std::uint32_t name, const char* i, std::uint32_t) {
+                auto* c = static_cast<Ctx*>(d);
+                if (std::string_view(i) == c->iface->name)
+                    c->bound = wl_registry_bind(reg, name, c->iface, c->version);
+            },
+        .global_remove = [](void*, wl_registry*, std::uint32_t) {},
+    };
+    auto* registry = wl_display_get_registry(f.client);
+    wl_registry_add_listener(registry, &listener, &ctx);
+    EXPECT_TRUE(f.roundtrip());
+    wl_registry_destroy(registry);
+    EXPECT_NE(ctx.bound, nullptr) << iface->name;
+    return f.track(static_cast<T*>(ctx.bound));
+}
+} // namespace
+
+TEST_F(InputTest, MiddleClickPasteThroughPrimarySelection)
+{
+    auto w = window(100, 100);
+    auto* mgr = bindGlobal<zwp_primary_selection_device_manager_v1>(*this, &zwp_primary_selection_device_manager_v1_interface, 1);
+    auto* device = track(zwp_primary_selection_device_manager_v1_get_device(mgr, seat));
+
+    struct Primary {
+        zwp_primary_selection_offer_v1* offer = nullptr;
+        int sendFd = -1;
+    } pr;
+    static const zwp_primary_selection_device_v1_listener deviceListener = {
+        .data_offer = [](void*, zwp_primary_selection_device_v1*, zwp_primary_selection_offer_v1*) {},
+        .selection = [](void* d, zwp_primary_selection_device_v1*, zwp_primary_selection_offer_v1* offer) {
+            auto* p = static_cast<Primary*>(d);
+            if (p->offer && p->offer != offer)
+                zwp_primary_selection_offer_v1_destroy(p->offer);
+            p->offer = offer;
+        },
+    };
+    static const zwp_primary_selection_source_v1_listener sourceListener = {
+        .send = [](void* d, zwp_primary_selection_source_v1*, const char*, std::int32_t fd) {
+            static_cast<Primary*>(d)->sendFd = fd;
+        },
+        .cancelled = [](void*, zwp_primary_selection_source_v1*) {},
+    };
+    zwp_primary_selection_device_v1_add_listener(device, &deviceListener, &pr);
+
+    // Select text with the mouse: the selection is set with that click's serial.
+    move(400, 300);
+    click(BTN_LEFT, true);
+    click(BTN_LEFT, false);
+    auto* source = track(zwp_primary_selection_device_manager_v1_create_source(mgr));
+    zwp_primary_selection_source_v1_add_listener(source, &sourceListener, &pr);
+    zwp_primary_selection_source_v1_offer(source, "text/plain");
+    zwp_primary_selection_device_v1_set_selection(device, source, in.lastButtonSerial);
+    ASSERT_TRUE(roundtrip());
+    ASSERT_NE(pr.offer, nullptr);
+    track(pr.offer);
+
+    int fds[2];
+    ASSERT_EQ(pipe2(fds, O_CLOEXEC), 0);
+    zwp_primary_selection_offer_v1_receive(pr.offer, "text/plain", fds[1]);
+    close(fds[1]);
+    ASSERT_TRUE(roundtrip());
+    ASSERT_GE(pr.sendFd, 0);
+    ASSERT_EQ(write(pr.sendFd, "selected", 8), 8);
+    close(pr.sendFd);
+    char buf[16] = {};
+    EXPECT_EQ(read(fds[0], buf, sizeof(buf)), 8);
+    EXPECT_STREQ(buf, "selected");
+    close(fds[0]);
+}
+
+TEST_F(InputTest, PrimarySelectionNeedsRealInput)
+{
+    auto w = window(100, 100);
+    auto* mgr = bindGlobal<zwp_primary_selection_device_manager_v1>(*this, &zwp_primary_selection_device_manager_v1_interface, 1);
+    auto* device = track(zwp_primary_selection_device_manager_v1_get_device(mgr, seat));
+    auto* source = track(zwp_primary_selection_device_manager_v1_create_source(mgr));
+    zwp_primary_selection_device_v1_set_selection(device, source, 4242); // never sent to us
+    ASSERT_TRUE(roundtrip());
+
+    EXPECT_EQ(server->seat().primarySelection(), nullptr);
+}
+
+TEST_F(InputTest, CursorShapeFromTheClientUnderThePointer)
+{
+    auto w = window(100, 100);
+    auto* mgr = bindGlobal<wp_cursor_shape_manager_v1>(*this, &wp_cursor_shape_manager_v1_interface, 2);
+    auto* device = track(wp_cursor_shape_manager_v1_get_pointer(mgr, pointer));
+    std::vector<std::uint32_t> shapes;
+    auto c = server->seat().cursorShapeChanged.connect([&](std::uint32_t s) { shapes.push_back(s); });
+
+    move(400, 300);
+    wp_cursor_shape_device_v1_set_shape(device, in.enterSerial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT);
+    ASSERT_TRUE(roundtrip());
+    wp_cursor_shape_device_v1_set_shape(device, in.enterSerial + 999, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_WAIT); // stale
+    ASSERT_TRUE(roundtrip());
+    wl_pointer_set_cursor(pointer, in.enterSerial, nullptr, 0, 0); // hide it (games do this)
+    ASSERT_TRUE(roundtrip());
+    move(10, 10); // leave: back to the default arrow
+    ASSERT_TRUE(roundtrip());
+
+    EXPECT_EQ(shapes, (std::vector<std::uint32_t>{WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT, 0, 1}));
+}
+
+namespace {
+std::string requestToken(test::ServerFixture& f, xdg_activation_v1* activation, std::optional<std::uint32_t> serial,
+                         wl_seat* seat)
+{
+    std::string token;
+    static const xdg_activation_token_v1_listener listener = {
+        .done = [](void* d, xdg_activation_token_v1*, const char* t) { *static_cast<std::string*>(d) = t; },
+    };
+    auto* t = xdg_activation_v1_get_activation_token(activation);
+    xdg_activation_token_v1_add_listener(t, &listener, &token);
+    if (serial)
+        xdg_activation_token_v1_set_serial(t, *serial, seat);
+    xdg_activation_token_v1_commit(t);
+    EXPECT_TRUE(f.roundtrip());
+    xdg_activation_token_v1_destroy(t);
+    return token;
+}
+} // namespace
+
+TEST_F(InputTest, ActivationWithAUserActionFocusesTheTarget)
+{
+    auto a = window(100, 100);
+    auto b = window(100, 100); // focused
+    auto* activation = bindGlobal<xdg_activation_v1>(*this, &xdg_activation_v1_interface, 1);
+
+    key(KEY_ENTER, true); // e.g. a key press in b that opens a link in a
+    key(KEY_ENTER, false);
+    const auto token = requestToken(*this, activation, in.lastKeySerial, seat);
+    ASSERT_FALSE(token.empty());
+    xdg_activation_v1_activate(activation, token.c_str(), a->surface);
+    ASSERT_TRUE(roundtrip());
+
+    EXPECT_EQ(in.keyboardSurface, a->surface);
+}
+
+TEST_F(InputTest, ActivationWithoutUserActionDoesNotStealFocus)
+{
+    auto a = window(100, 100);
+    auto b = window(100, 100);
+    auto* activation = bindGlobal<xdg_activation_v1>(*this, &xdg_activation_v1_interface, 1);
+
+    const auto token = requestToken(*this, activation, std::nullopt, seat);
+    xdg_activation_v1_activate(activation, token.c_str(), a->surface);
+    ASSERT_TRUE(roundtrip());
+
+    EXPECT_EQ(in.keyboardSurface, b->surface);
+}
+
+TEST_F(InputTest, LaunchTokenFocusesTheLaunchedApp)
+{
+    auto a = window(100, 100);
+    auto b = window(100, 100);
+    auto* activation = bindGlobal<xdg_activation_v1>(*this, &xdg_activation_v1_interface, 1);
+
+    // What an app launched with Mod+Enter finds in XDG_ACTIVATION_TOKEN.
+    const auto token = server->activation().createCompositorToken();
+    xdg_activation_v1_activate(activation, token.c_str(), a->surface);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(in.keyboardSurface, a->surface);
+
+    xdg_activation_v1_activate(activation, token.c_str(), b->surface); // single use
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(in.keyboardSurface, a->surface);
 }

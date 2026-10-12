@@ -2,18 +2,33 @@
 
 #include "core/Log.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
 #include <spawn.h>
+#include <string_view>
 #include <sys/wait.h>
 
 extern char** environ;
 
 namespace dragon::process {
 
-bool spawn(const std::string& command)
+bool spawn(const std::string& command, const std::vector<std::string>& extraEnv)
 {
+    // Our environment, with extraEnv replacing same-named variables.
+    std::vector<std::string> env(extraEnv);
+    for (char** e = environ; *e; ++e) {
+        const std::string_view entry(*e);
+        const auto name = entry.substr(0, entry.find('=') + 1);
+        if (std::ranges::none_of(extraEnv, [&](const std::string& x) { return x.starts_with(name); }))
+            env.emplace_back(entry);
+    }
+    std::vector<char*> envp;
+    for (auto& e : env)
+        envp.push_back(e.data());
+    envp.push_back(nullptr);
+
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
 
@@ -29,7 +44,7 @@ bool spawn(const std::string& command)
 
     const char* argv[] = {"/bin/sh", "-c", command.c_str(), nullptr};
     pid_t pid = 0;
-    const int err = posix_spawn(&pid, "/bin/sh", nullptr, &attr, const_cast<char* const*>(argv), environ);
+    const int err = posix_spawn(&pid, "/bin/sh", nullptr, &attr, const_cast<char* const*>(argv), envp.data());
     posix_spawnattr_destroy(&attr);
 
     if (err != 0) {

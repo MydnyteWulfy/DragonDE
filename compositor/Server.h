@@ -3,8 +3,12 @@
 #include "core/Signal.h"
 #include "wayland/Global.h"
 
+#include "core/Geometry.h"
+
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 struct wl_display;
@@ -12,13 +16,16 @@ struct wl_display;
 namespace dragon {
 
 struct DmabufSupport;
+class CursorShapeManager;
 class EventLoop;
 class LinuxDmabuf;
 class Output;
 class OutputGlobal;
 class Seat;
 class Surface;
+class XdgActivation;
 class XdgPopup;
+class XdgSurface;
 class XdgToplevel;
 
 // The Wayland server side: owns the globals clients bind to and announces new
@@ -42,6 +49,15 @@ public:
     OutputGlobal* outputGlobal(const Output& output) const;
 
     Seat& seat() const { return *m_seat; }
+    XdgActivation& activation() const { return *m_activation; }
+
+    // Where popups of `parent` must fit, in its window-geometry coordinates
+    // (the desktop knows where things are; nullopt: unconstrained).
+    std::function<std::optional<Rect>(const XdgSurface& parent)> popupBoundsProvider;
+    std::optional<Rect> popupBounds(const XdgSurface& parent) const
+    {
+        return popupBoundsProvider ? popupBoundsProvider(parent) : std::nullopt;
+    }
 
     Signal<Surface*> surfaceCreated;
     Signal<XdgToplevel*> toplevelCreated;
@@ -56,6 +72,9 @@ private:
     std::unique_ptr<LinuxDmabuf> m_dmabuf;
     std::unique_ptr<Seat> m_seat;
     std::unique_ptr<Global> m_dataDeviceManager;
+    std::unique_ptr<Global> m_primarySelectionManager;
+    std::unique_ptr<CursorShapeManager> m_cursorShapeManager;
+    std::unique_ptr<XdgActivation> m_activation;
     std::vector<std::unique_ptr<OutputGlobal>> m_outputs;
     Connection m_flush;
 };

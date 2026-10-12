@@ -4,10 +4,12 @@
 #include "core/EventLoop.h"
 #include "core/Log.h"
 #include "protocols/Compositor.h"
+#include "protocols/CursorShape.h"
 #include "protocols/DataDevice.h"
 #include "protocols/LinuxDmabuf.h"
 #include "protocols/Output.h"
 #include "protocols/Seat.h"
+#include "protocols/XdgActivation.h"
 #include "protocols/XdgShell.h"
 
 #include <algorithm>
@@ -42,6 +44,12 @@ Server::Server(wl_display* display, EventLoop& loop) : m_display(display), m_loo
     m_dataDeviceManager = Global::create<proto::WlDataDeviceManager>(
         display, kDataDeviceManagerVersion, [this](wl_client* client, std::uint32_t version, std::uint32_t id) {
             makeResource<DataDeviceManager>(client, version, id, *m_seat);
+        });
+    m_cursorShapeManager = std::make_unique<CursorShapeManager>(*this, *m_seat);
+    m_activation = std::make_unique<XdgActivation>(*this);
+    m_primarySelectionManager = Global::create<proto::ZwpPrimarySelectionDeviceManagerV1>(
+        display, 1, [this](wl_client* client, std::uint32_t version, std::uint32_t id) {
+            makeResource<PrimaryDeviceManager>(client, version, id, *m_seat);
         });
 
     // wl_shm comes from libwayland: it already guards against clients

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Signal.h"
+#include "dragon-protocols/primary-selection-unstable-v1.h"
 #include "dragon-protocols/wayland.h"
 
 #include <string>
@@ -68,6 +69,62 @@ public:
 protected:
     void handleCreateDataSource(std::uint32_t id) override;
     void handleGetDataDevice(std::uint32_t id, wl_resource* seat) override;
+
+private:
+    Seat& m_seat;
+};
+
+// Primary selection (middle-click paste): the same model with its own objects.
+// Whatever text was last selected is offered; pasting reads it from the source.
+
+class PrimarySource final : public proto::ZwpPrimarySelectionSourceV1 {
+public:
+    using proto::ZwpPrimarySelectionSourceV1::ZwpPrimarySelectionSourceV1;
+    static PrimarySource* from(wl_resource* resource)
+    {
+        return static_cast<PrimarySource*>(proto::ZwpPrimarySelectionSourceV1::fromResource(resource));
+    }
+    const std::vector<std::string>& mimeTypes() const { return m_mimeTypes; }
+
+protected:
+    void handleOffer(std::string_view mimeType) override { m_mimeTypes.emplace_back(mimeType); }
+
+private:
+    std::vector<std::string> m_mimeTypes;
+};
+
+class PrimaryOffer final : public proto::ZwpPrimarySelectionOfferV1 {
+public:
+    PrimaryOffer(wl_client* client, std::uint32_t version, std::uint32_t id, PrimarySource* source);
+
+protected:
+    void handleReceive(std::string_view mimeType, std::int32_t fd) override;
+
+private:
+    PrimarySource* m_source;
+    Connection m_sourceGone;
+};
+
+class PrimaryDevice final : public proto::ZwpPrimarySelectionDeviceV1 {
+public:
+    PrimaryDevice(wl_client* client, std::uint32_t version, std::uint32_t id, Seat& seat)
+        : ZwpPrimarySelectionDeviceV1(client, version, id), m_seat(seat) {}
+
+protected:
+    void handleSetSelection(wl_resource* source, std::uint32_t serial) override;
+
+private:
+    Seat& m_seat;
+};
+
+class PrimaryDeviceManager final : public proto::ZwpPrimarySelectionDeviceManagerV1 {
+public:
+    PrimaryDeviceManager(wl_client* client, std::uint32_t version, std::uint32_t id, Seat& seat)
+        : ZwpPrimarySelectionDeviceManagerV1(client, version, id), m_seat(seat) {}
+
+protected:
+    void handleCreateSource(std::uint32_t id) override;
+    void handleGetDevice(std::uint32_t id, wl_resource* seat) override;
 
 private:
     Seat& m_seat;

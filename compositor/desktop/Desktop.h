@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+struct wl_client;
+
 namespace dragon {
 
 class Server;
@@ -40,7 +42,7 @@ public:
     };
 
     // Where new windows get placed and what maximized windows fill.
-    void setArea(Rect area) { m_area = area; }
+    void setArea(Rect area);
     Rect area() const { return m_area; }
 
     // Global window geometry (position + xdg window geometry size).
@@ -79,6 +81,12 @@ public:
     void focus(Window* window);
     Window* focusedWindow() const { return m_focused; }
 
+    // Popup grabs (menus): while one is active the topmost grabbing popup has
+    // the keyboard, and input outside its client dismisses the whole chain.
+    bool popupGrabActive() const { return !m_popupGrabs.empty(); }
+    wl_client* popupGrabClient() const;
+    void dismissPopups();
+
     Signal<Window*> windowMapped;
     Signal<Window*> focusChanged;
     // The client asked to be moved/resized by the pointer (e.g. dragging its title bar).
@@ -97,6 +105,9 @@ private:
     static Surface* rootSurface(Surface* surface); // up through subsurface parents
     static bool hitTree(Surface* surface, Point origin, PointF point, Hit& hit);
     void committed(Window& window);
+    void popupMapped(XdgPopup* popup);
+    void popupGone(XdgPopup* popup);
+    void restoreKeyboardFocus();
     void setFillState(Window& window, bool on, bool fullscreen);
 
     Server& m_server;
@@ -105,10 +116,13 @@ private:
     Rect m_area{0, 0, 1280, 720};
     int m_cascade = 0;
     std::vector<std::unique_ptr<Window>> m_windows;
-    std::vector<XdgPopup*> m_popups; // mapped, in mapping order
+    std::vector<XdgToplevel*> m_toplevels; // all of them, mapped or not
+    std::vector<XdgPopup*> m_popups;     // mapped, in mapping order
+    std::vector<XdgPopup*> m_popupGrabs; // grabbing popups, topmost last
     std::unordered_map<const void*, std::unique_ptr<Tracked>> m_tracked;
     Connection m_toplevelCreated;
     Connection m_popupCreated;
+    Connection m_activation;
 };
 
 } // namespace dragon

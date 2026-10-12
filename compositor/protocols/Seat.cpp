@@ -26,15 +26,23 @@ constexpr const char* kCursorRole = "wl_pointer-cursor";
 
 class PointerResource final : public proto::WlPointer {
 public:
-    using proto::WlPointer::WlPointer;
+    PointerResource(wl_client* client, std::uint32_t version, std::uint32_t id, Seat& seat)
+        : WlPointer(client, version, id), m_seat(seat) {}
 
 protected:
-    void handleSetCursor(std::uint32_t, wl_resource* surface, std::int32_t, std::int32_t) override
+    void handleSetCursor(std::uint32_t serial, wl_resource* surface, std::int32_t, std::int32_t) override
     {
-        // The role is enforced; drawing client cursors comes with cursor rendering.
-        if (Surface* s = surface ? Surface::from(surface) : nullptr; s && (s->role() || !s->setRoleName(kCursorRole)))
+        Surface* s = surface ? Surface::from(surface) : nullptr;
+        if (s && (s->role() || !s->setRoleName(kCursorRole))) {
             postError(proto::WlPointerError::Role, "cursor surface already has another role");
+            return;
+        }
+        // Null surface: hide the cursor. A surface: the client's own image.
+        m_seat.requestCursor(client(), serial, s ? std::nullopt : std::optional<std::uint32_t>(Seat::kHiddenCursor));
     }
+
+private:
+    Seat& m_seat;
 };
 
 class SeatResource final : public proto::WlSeat {
@@ -45,7 +53,7 @@ public:
 protected:
     void handleGetPointer(std::uint32_t id) override
     {
-        if (auto* p = makeResource<PointerResource>(client(), version(), id))
+        if (auto* p = makeResource<PointerResource>(client(), version(), id, m_seat))
             m_seat.addPointer(p);
     }
     void handleGetKeyboard(std::uint32_t id) override
@@ -208,6 +216,7 @@ void Seat::setKeyboardFocus(Surface* surface)
         for (auto* kb : m_keyboards.forClient(surface->client()))
             sendKeyboardEnter(*kb, serial);
         sendSelection(surface->client());
+        sendPrimarySelection(surface->client());
     }
 }
 
@@ -225,6 +234,7 @@ void Seat::notifyKey(std::uint32_t timeMs, std::uint32_t key, bool pressed)
         xkb_state_update_key(m_xkbState, key + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP); // evdev -> XKB keycode
 
     const std::uint32_t serial = nextSerial();
+    rememberInput(serial, m_keyboardFocus); // presses and releases: menus open on either
     if (m_keyboardFocus) {
         const auto state = pressed ? proto::WlKeyboardKeyState::Pressed : proto::WlKeyboardKeyState::Released;
         for (auto* kb : m_keyboards.forClient(m_keyboardFocus->client()))
@@ -257,6 +267,21 @@ bool Seat::modifierActive(const char* name) const
     return m_xkbState && xkb_state_mod_name_is_active(m_xkbState, name, XKB_STATE_MODS_EFFECTIVE) > 0;
 }
 
+void Seat::rememberInput(std::uint32_t serial, Surface* focus)
+{
+    if (!focus)
+        return;
+    m_recentInput.push_back({serial, focus->client()});
+    if (m_recentInput.size() > 16)
+        m_recentInput.erase(m_recentInput.begin());
+}
+
+bool Seat::isRecentInputSerial(wl_client* client, std::uint32_t serial) const
+{
+    return std::ranges::any_of(m_recentInput,
+                               [&](const InputSerial& s) { return s.serial == serial && s.client == client; });
+}
+
 // ----------------------------------------------------------------- pointer --
 
 void Seat::addPointer(proto::WlPointer* pointer)
@@ -284,12 +309,30 @@ void Seat::notifyPointerFocus(Surface* surface, PointF local)
     m_pointerFocus = surface;
     m_pointerFocusGone = surface ? surface->aboutToBeDestroyed.connect([this] { m_pointerFocus = nullptr; })
                                  : Connection{};
+    m_pointerEnterSerial = serial;
+    // Until the new client picks a cursor, show the default one.
+    setCursorShape(kDefaultCursor);
     if (surface) {
         for (auto* p : m_pointers.forClient(surface->client())) {
             p->sendEnter(serial, surface->resource(), local.x, local.y);
             p->sendFrame();
         }
     }
+}
+
+void Seat::requestCursor(wl_client* client, std::uint32_t serial, std::optional<std::uint32_t> shape)
+{
+    if (!m_pointerFocus || m_pointerFocus->client() != client || serial != m_pointerEnterSerial)
+        return; // not under the pointer, or reacting to an older enter
+    setCursorShape(shape.value_or(kDefaultCursor));
+}
+
+void Seat::setCursorShape(std::uint32_t shape)
+{
+    if (shape == m_cursorShape)
+        return;
+    m_cursorShape = shape;
+    cursorShapeChanged.emit(shape);
 }
 
 void Seat::notifyPointerMotion(std::uint32_t timeMs, PointF local)
@@ -311,6 +354,7 @@ void Seat::notifyButton(std::uint32_t timeMs, std::uint32_t button, bool pressed
     const std::uint32_t serial = nextSerial();
     if (pressed)
         m_lastButtonSerial = serial;
+    rememberInput(serial, m_pointerFocus);
     if (!m_pointerFocus)
         return;
     const auto state = pressed ? proto::WlPointerButtonState::Pressed : proto::WlPointerButtonState::Released;
@@ -384,6 +428,47 @@ void Seat::sendSelection(wl_client* client)
             continue;
         device->sendDataOffer(offer->resource());
         for (const auto& mime : m_selection->mimeTypes())
+            offer->sendOffer(mime.c_str());
+        device->sendSelection(offer->resource());
+    }
+}
+
+void Seat::addPrimaryDevice(proto::ZwpPrimarySelectionDeviceV1* device)
+{
+    m_primaryDevices.add(device);
+    if (m_keyboardFocus && m_keyboardFocus->client() == device->client())
+        sendPrimarySelection(device->client());
+}
+
+void Seat::setPrimarySelection(PrimarySource* source)
+{
+    if (source == m_primary)
+        return;
+    if (m_primary)
+        m_primary->sendCancelled();
+    m_primary = source;
+    m_primaryGone = source ? source->destroyed.connect([this] {
+        m_primary = nullptr;
+        if (m_keyboardFocus)
+            sendPrimarySelection(m_keyboardFocus->client());
+    })
+                           : Connection{};
+    if (m_keyboardFocus)
+        sendPrimarySelection(m_keyboardFocus->client());
+}
+
+void Seat::sendPrimarySelection(wl_client* client)
+{
+    for (auto* device : m_primaryDevices.forClient(client)) {
+        if (!m_primary) {
+            device->sendSelection(nullptr);
+            continue;
+        }
+        auto* offer = makeResource<PrimaryOffer>(client, device->version(), 0u, m_primary);
+        if (!offer)
+            continue;
+        device->sendDataOffer(offer->resource());
+        for (const auto& mime : m_primary->mimeTypes())
             offer->sendOffer(mime.c_str());
         device->sendSelection(offer->resource());
     }

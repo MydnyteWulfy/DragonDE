@@ -22,6 +22,7 @@ public:
     const char* name() const override { return "nested"; }
     std::optional<dev_t> preferredDevice() const override;
     bool start(Gpu& gpu) override;
+    void setCursorShape(std::uint32_t shape) override;
 
     struct Parent; // connection state, defined in the .cpp
 

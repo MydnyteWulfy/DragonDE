@@ -42,8 +42,29 @@ struct NestedBackend::Parent {
     wl_seat* seat = nullptr;
     wl_pointer* pointer = nullptr;
     wl_keyboard* keyboard = nullptr;
-    wp_cursor_shape_device_v1* cursorShape = nullptr;
+    wp_cursor_shape_device_v1* cursorShapeDevice = nullptr;
     Output* pointerOutput = nullptr; // the window the pointer is over
+    std::uint32_t pointerSerial = 0;  // of the parent's latest pointer enter
+    std::uint32_t cursorShape = 1;    // what our clients asked for (wp_cursor_shape values, 0 = hidden)
+    std::uint32_t cursorShapeVersion = 1;
+
+    // Shows `cursorShape` on the parent's pointer.
+    void applyCursor()
+    {
+        if (!pointer || !pointerOutput)
+            return;
+        if (cursorShape == 0) {
+            wl_pointer_set_cursor(pointer, pointerSerial, nullptr, 0, 0);
+            return;
+        }
+        if (!cursorShapeManager)
+            return; // the parent can't do shapes: it keeps showing whatever it showed
+        if (!cursorShapeDevice)
+            cursorShapeDevice = wp_cursor_shape_manager_v1_get_pointer(cursorShapeManager, pointer);
+        // Shapes newer than the parent knows fall back to the arrow.
+        const std::uint32_t shape = cursorShapeVersion < 2 && cursorShape > 34 ? 1 : cursorShape;
+        wp_cursor_shape_device_v1_set_shape(cursorShapeDevice, pointerSerial, shape);
+    }
     std::set<std::uint32_t> pressedKeys;
     PointerAxisEvent pendingAxis[2];    // vertical, horizontal; flushed on frame
     bool axisPending[2] = {false, false};
@@ -70,8 +91,8 @@ struct NestedBackend::Parent {
 
     ~Parent()
     {
-        if (cursorShape)
-            wp_cursor_shape_device_v1_destroy(cursorShape);
+        if (cursorShapeDevice)
+            wp_cursor_shape_device_v1_destroy(cursorShapeDevice);
         if (cursorShapeManager)
             wp_cursor_shape_manager_v1_destroy(cursorShapeManager);
         if (pointer)
@@ -175,15 +196,12 @@ PointerAxisEvent& axisFor(Parent& p, std::uint32_t axis)
 
 const wl_pointer_listener kPointerListener = {
     .enter =
-        [](void* data, wl_pointer* pointer, std::uint32_t serial, wl_surface* surface, wl_fixed_t x, wl_fixed_t y) {
+        [](void* data, wl_pointer*, std::uint32_t serial, wl_surface* surface, wl_fixed_t x, wl_fixed_t y) {
             auto& p = *static_cast<Parent*>(data);
             p.pointerOutput = outputForSurface(p, surface);
-            // The parent draws the cursor over our window: ask for its plain arrow.
-            if (p.cursorShapeManager) {
-                if (!p.cursorShape)
-                    p.cursorShape = wp_cursor_shape_manager_v1_get_pointer(p.cursorShapeManager, pointer);
-                wp_cursor_shape_device_v1_set_shape(p.cursorShape, serial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
-            }
+            p.pointerSerial = serial;
+            // The parent draws the cursor over our window: show what our client wants.
+            p.applyCursor();
             if (p.pointerOutput)
                 p.backend->input.pointerMotionAbsolute.emit(p.pointerOutput, wl_fixed_to_double(x),
                                                             wl_fixed_to_double(y), 0);
@@ -317,8 +335,9 @@ const wl_registry_listener kRegistryListener = {
                 p->seat = static_cast<wl_seat*>(bind(&wl_seat_interface, 8));
                 wl_seat_add_listener(p->seat, &kSeatListener, p);
             } else if (i == wp_cursor_shape_manager_v1_interface.name) {
+                p->cursorShapeVersion = std::min(version, 2u);
                 p->cursorShapeManager =
-                    static_cast<wp_cursor_shape_manager_v1*>(bind(&wp_cursor_shape_manager_v1_interface, 1));
+                    static_cast<wp_cursor_shape_manager_v1*>(bind(&wp_cursor_shape_manager_v1_interface, 2));
             }
         },
     .global_remove = [](void*, wl_registry*, std::uint32_t) {},
@@ -616,6 +635,12 @@ bool NestedBackend::start(Gpu& gpu)
 
     log::error("backend", "nested: no format/modifier both we and the parent compositor support");
     return false;
+}
+
+void NestedBackend::setCursorShape(std::uint32_t shape)
+{
+    m_parent->cursorShape = shape;
+    m_parent->applyCursor();
 }
 
 void NestedBackend::handleParentEvents(std::uint32_t mask)

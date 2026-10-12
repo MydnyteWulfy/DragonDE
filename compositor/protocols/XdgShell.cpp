@@ -26,10 +26,24 @@ bool hasBottom(std::uint32_t v) { return v == 2 || v == 6 || v == 8; }
 
 // ---------------------------------------------------------- PositionerState --
 
-Rect PositionerState::place() const
+Rect PositionerState::unconstrained(bool flipX, bool flipY) const
 {
-    const auto a = std::uint32_t(anchor);
-    const auto g = std::uint32_t(gravity);
+    auto a = std::uint32_t(anchor);
+    auto g = std::uint32_t(gravity);
+    Point off = offset;
+    // Flipping swaps left<->right (or top<->bottom) in anchor and gravity, and mirrors the offset.
+    auto swapH = [](std::uint32_t v) -> std::uint32_t {
+        static constexpr std::uint32_t map[] = {0, 1, 2, 4, 3, 7, 8, 5, 6};
+        return v <= 8 ? map[v] : v;
+    };
+    auto swapV = [](std::uint32_t v) -> std::uint32_t {
+        static constexpr std::uint32_t map[] = {0, 2, 1, 3, 4, 6, 5, 8, 7};
+        return v <= 8 ? map[v] : v;
+    };
+    if (flipX)
+        a = swapH(a), g = swapH(g), off.x = -off.x;
+    if (flipY)
+        a = swapV(a), g = swapV(g), off.y = -off.y;
 
     Point p{anchorRect.x + anchorRect.width / 2, anchorRect.y + anchorRect.height / 2};
     if (hasLeft(a))
@@ -51,7 +65,56 @@ Rect PositionerState::place() const
     else if (!hasBottom(g))
         p.y -= size.height / 2;
 
-    return {p.x + offset.x, p.y + offset.y, size.width, size.height};
+    return {p.x + off.x, p.y + off.y, size.width, size.height};
+}
+
+Rect PositionerState::place(std::optional<Rect> bounds) const
+{
+    Rect r = unconstrained(false, false);
+    if (!bounds || bounds->empty())
+        return r;
+    const Rect b = *bounds;
+    using CA = proto::XdgPositionerConstraintAdjustment;
+    auto allowed = [this](CA flag) { return proto::hasFlags(constraintAdjustment, flag); };
+    auto outX = [&b](const Rect& q) { return q.x < b.x || q.x + q.width > b.x + b.width; };
+    auto outY = [&b](const Rect& q) { return q.y < b.y || q.y + q.height > b.y + b.height; };
+
+    // Horizontal: flip, then slide, then resize.
+    if (outX(r) && allowed(CA::FlipX)) {
+        const Rect flipped = unconstrained(true, false);
+        if (!outX(flipped))
+            r.x = flipped.x;
+    }
+    if (outX(r) && allowed(CA::SlideX)) {
+        if (r.x + r.width > b.x + b.width)
+            r.x = b.x + b.width - r.width;
+        if (r.x < b.x) // also when wider than the bounds: align the left edges
+            r.x = b.x;
+    }
+    if (outX(r) && allowed(CA::ResizeX)) {
+        const std::int32_t x0 = std::max(r.x, b.x), x1 = std::min(r.x + r.width, b.x + b.width);
+        if (x1 > x0)
+            r.x = x0, r.width = x1 - x0;
+    }
+
+    // Vertical, same order.
+    if (outY(r) && allowed(CA::FlipY)) {
+        const Rect flipped = unconstrained(false, true);
+        if (!outY(flipped))
+            r.y = flipped.y;
+    }
+    if (outY(r) && allowed(CA::SlideY)) {
+        if (r.y + r.height > b.y + b.height)
+            r.y = b.y + b.height - r.height;
+        if (r.y < b.y)
+            r.y = b.y;
+    }
+    if (outY(r) && allowed(CA::ResizeY)) {
+        const std::int32_t y0 = std::max(r.y, b.y), y1 = std::min(r.y + r.height, b.y + b.height);
+        if (y1 > y0)
+            r.y = y0, r.height = y1 - y0;
+    }
+    return r;
 }
 
 // ------------------------------------------------------------ XdgPositioner --
@@ -390,6 +453,16 @@ void XdgToplevel::setSize(Size size)
 }
 
 void XdgToplevel::setActivated(bool on) { update(&Configure::activated, on); }
+
+void XdgToplevel::setBounds(Size bounds)
+{
+    if (bounds == m_bounds)
+        return;
+    m_bounds = bounds;
+    m_boundsChanged = true;
+    if (m_xdg)
+        m_xdg->scheduleConfigure();
+}
 void XdgToplevel::setMaximized(bool on) { update(&Configure::maximized, on); }
 void XdgToplevel::setFullscreen(bool on) { update(&Configure::fullscreen, on); }
 void XdgToplevel::setResizing(bool on) { update(&Configure::resizing, on); }
@@ -407,6 +480,11 @@ void XdgToplevel::sendRoleConfigure(std::uint32_t serial)
         sendWmCapabilities(&caps);
         wl_array_release(&caps);
         m_sentCapabilities = true;
+    }
+
+    if (m_boundsChanged) {
+        sendConfigureBounds(m_bounds.width, m_bounds.height); // dropped below v4
+        m_boundsChanged = false;
     }
 
     wl_array states;
@@ -551,7 +629,8 @@ void XdgToplevel::handleSetMinimized()
 
 XdgPopup::XdgPopup(wl_client* client, std::uint32_t version, std::uint32_t id, XdgSurface* xdg, XdgSurface* parent,
                    const PositionerState& positioner)
-    : proto::XdgPopup(client, version, id), m_xdg(xdg), m_parent(parent), m_geometry(positioner.place())
+    : proto::XdgPopup(client, version, id), m_xdg(xdg), m_parent(parent),
+      m_geometry(positioner.place(parent ? xdg->server().popupBounds(*parent) : std::nullopt))
 {
     if (parent) {
         m_parentDying = parent->destroyed.connect([this] {
@@ -575,6 +654,15 @@ void XdgPopup::dismiss()
     sendPopupDone();
 }
 
+void XdgPopup::handleGrab(wl_resource*, std::uint32_t serial)
+{
+    if (m_xdg && m_xdg->isMapped()) {
+        postError(proto::XdgPopupError::InvalidGrab, "grab requested after the popup was mapped");
+        return;
+    }
+    m_grabSerial = serial; // the desktop validates it and sets up the grab on map
+}
+
 void XdgPopup::handleReposition(wl_resource* positioner, std::uint32_t token)
 {
     const PositionerState* pos = XdgPositioner::from(positioner);
@@ -583,7 +671,7 @@ void XdgPopup::handleReposition(wl_resource* positioner, std::uint32_t token)
             p->postError(proto::XdgPositionerError::InvalidInput, "positioner needs set_size and set_anchor_rect");
         return;
     }
-    m_geometry = pos->place();
+    m_geometry = pos->place(m_parent && m_xdg ? m_xdg->server().popupBounds(*m_parent) : std::nullopt);
     m_repositionToken = token;
     if (m_xdg)
         m_xdg->scheduleConfigure();
