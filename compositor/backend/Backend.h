@@ -14,6 +14,33 @@
 namespace dragon {
 
 class Gpu;
+class Output;
+
+struct PointerAxisEvent {
+    enum class Source { Wheel, Finger, Continuous, WheelTilt };
+
+    std::uint32_t timeMs = 0;
+    bool horizontal = false;
+    double value = 0.0;         // scroll distance in surface pixels
+    std::int32_t value120 = 0;  // wheels: 120 per notch (0 for touchpads)
+    Source source = Source::Wheel;
+    bool stop = false;          // fingers lifted: scrolling ended
+};
+
+// Raw input from a backend, in a device-independent form: evdev key and
+// button codes, positions in output pixels. The seat turns these into
+// Wayland events for whatever has focus.
+struct InputEvents {
+    // Pointer at (x, y) on an output (nested window, tablets). Null output: the first one.
+    Signal<Output*, double, double, std::uint32_t> pointerMotionAbsolute; // output, x, y, time
+    Signal<std::uint32_t, bool, std::uint32_t> pointerButton;           // evdev button, pressed, time
+    Signal<const PointerAxisEvent&> pointerAxis;
+    Signal<> pointerFrame; // ends a group of pointer events that belong together
+    Signal<> pointerLeft;  // left every output (nested: left the window)
+    Signal<std::uint32_t, bool, std::uint32_t> key; // evdev keycode, pressed, time
+    // Keymap in XKB text format (nested: the parent's, so layouts match).
+    Signal<const std::string&> keymap;
+};
 
 struct OutputMode {
     std::int32_t width = 0;  // pixels
@@ -106,6 +133,7 @@ public:
 
     Signal<Output*> outputAdded;
     Signal<Output*> outputRemoved;
+    InputEvents input;
     // The backend can't continue (nested window closed, parent compositor gone, ...).
     Signal<> quitRequested;
 

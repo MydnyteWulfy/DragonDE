@@ -2,9 +2,11 @@
 
 #include "Server.h"
 #include "core/Log.h"
+#include "protocols/Seat.h"
 #include "protocols/XdgShell.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace dragon {
 
@@ -13,7 +15,7 @@ struct Desktop::Tracked {
     std::vector<Connection> connections;
 };
 
-Desktop::Desktop(Server& server)
+Desktop::Desktop(Server& server) : m_server(server)
 {
     m_toplevelCreated = server.toplevelCreated.connect([this](XdgToplevel* t) { trackToplevel(t); });
     m_popupCreated = server.popupCreated.connect([this](XdgPopup* p) { trackPopup(p); });
@@ -66,9 +68,11 @@ void Desktop::mapWindow(XdgToplevel* toplevel)
     pos.y = std::max(pos.y, m_area.y);
 
     m_windows.push_back(std::make_unique<Window>(Window{toplevel, pos}));
+    Window* window = m_windows.back().get();
     log::debug("desktop", "mapped '{}' ({}) {}x{} at {},{}", toplevel->title(), toplevel->appId(), geometry.width,
                geometry.height, pos.x, pos.y);
-    windowMapped.emit(m_windows.back().get());
+    windowMapped.emit(window);
+    focus(window); // new windows get focus
 }
 
 void Desktop::unmapWindow(XdgToplevel* toplevel)
@@ -79,6 +83,10 @@ void Desktop::unmapWindow(XdgToplevel* toplevel)
     auto window = std::move(*it);
     m_windows.erase(it);
     windowUnmapped.emit(window.get());
+    if (m_focused == window.get()) {
+        m_focused = nullptr;
+        focus(m_windows.empty() ? nullptr : m_windows.back().get()); // next one down
+    }
 }
 
 XdgToplevel* Desktop::rootToplevel(const XdgPopup* popup)
@@ -133,6 +141,111 @@ std::vector<Desktop::RenderItem> Desktop::renderList() const
         }
     }
     return items;
+}
+
+void Desktop::focus(Window* window)
+{
+    if (window) {
+        // Raise: move to the top of the stack.
+        auto it = std::ranges::find_if(m_windows, [window](const auto& w) { return w.get() == window; });
+        if (it == m_windows.end())
+            return;
+        std::rotate(it, it + 1, m_windows.end());
+    }
+    if (window == m_focused)
+        return;
+
+    if (m_focused)
+        m_focused->toplevel->setActivated(false);
+    m_focused = window;
+    Surface* surface = nullptr;
+    if (window) {
+        window->toplevel->setActivated(true);
+        if (auto* xdg = window->toplevel->xdgSurface())
+            surface = xdg->surface();
+    }
+    m_server.seat().setKeyboardFocus(surface);
+    focusChanged.emit(window);
+}
+
+Surface* Desktop::rootSurface(Surface* surface)
+{
+    while (surface) {
+        auto* sub = surface->asSubsurface();
+        if (!sub || !sub->parent())
+            return surface;
+        surface = sub->parent();
+    }
+    return nullptr;
+}
+
+std::optional<Point> Desktop::originOf(Surface* surface) const
+{
+    Point offset;
+    Surface* s = surface;
+    while (auto* sub = s ? s->asSubsurface() : nullptr) {
+        if (!sub->parent())
+            return std::nullopt;
+        offset = offset + sub->position();
+        s = sub->parent();
+    }
+    if (!s)
+        return std::nullopt;
+    const auto* xdg = dynamic_cast<const XdgSurface*>(s->role());
+    if (!xdg)
+        return std::nullopt;
+    auto origin = surfaceOrigin(xdg);
+    if (!origin)
+        return std::nullopt;
+    return *origin + offset;
+}
+
+Desktop::Window* Desktop::windowOf(Surface* surface) const
+{
+    Surface* root = rootSurface(surface);
+    const auto* xdg = root ? dynamic_cast<const XdgSurface*>(root->role()) : nullptr;
+    if (!xdg)
+        return nullptr;
+    if (xdg->toplevel())
+        return windowFor(xdg->toplevel());
+    if (xdg->popup())
+        return windowFor(rootToplevel(xdg->popup()));
+    return nullptr;
+}
+
+bool Desktop::hitTree(Surface* surface, Point origin, PointF point, Hit& hit)
+{
+    const auto& stack = surface->stack();
+    for (auto it = stack.rbegin(); it != stack.rend(); ++it) { // topmost first
+        Surface* entry = *it;
+        if (entry == surface) {
+            if (!surface->hasContent())
+                continue;
+            const PointF local = point - origin;
+            const Size size = surface->size();
+            const Point cell{std::int32_t(std::floor(local.x)), std::int32_t(std::floor(local.y))};
+            if (local.x >= 0 && local.y >= 0 && local.x < size.width && local.y < size.height &&
+                surface->state().input.contains(cell)) {
+                hit = {surface, local};
+                return true;
+            }
+        } else if (auto* sub = entry->asSubsurface(); sub && entry->hasContent()) {
+            if (hitTree(entry, origin + sub->position(), point, hit))
+                return true;
+        }
+    }
+    return false;
+}
+
+Desktop::Hit Desktop::surfaceAt(PointF point) const
+{
+    const auto items = renderList();
+    for (auto it = items.rbegin(); it != items.rend(); ++it) {
+        Hit hit;
+        if (hitTree(it->surface, it->origin, point, hit))
+            return hit;
+    }
+    return {};
 }
 
 } // namespace dragon

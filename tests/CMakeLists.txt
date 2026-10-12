@@ -8,6 +8,7 @@ add_executable(dragon-tests
     server/XdgShellTest.cpp
     desktop/DesktopRenderTest.cpp
     desktop/DmabufTest.cpp
+    desktop/InputTest.cpp
 )
 target_link_libraries(dragon-tests PRIVATE
     dragon_wayland

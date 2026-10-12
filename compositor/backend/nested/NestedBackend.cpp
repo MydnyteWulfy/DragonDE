@@ -9,13 +9,16 @@
 #include <cstring>
 #include <drm_fourcc.h>
 #include <gbm.h>
+#include <linux/input-event-codes.h>
 #include <map>
+#include <set>
 #include <sys/mman.h>
 #include <sys/sysmacros.h>
 #include <vector>
 #include <wayland-client.h>
 #include <wayland-server-core.h> // WL_EVENT_* for our own event loop
 
+#include "cursor-shape-v1-client-protocol.h"
 #include "linux-dmabuf-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
@@ -25,6 +28,7 @@ namespace dragon {
 // ------------------------------------------------------------ parent state --
 
 struct NestedBackend::Parent {
+    NestedBackend* backend = nullptr;
     wl_display* display = nullptr;
     wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
@@ -32,6 +36,17 @@ struct NestedBackend::Parent {
     zwp_linux_dmabuf_v1* dmabuf = nullptr;
     std::uint32_t dmabufVersion = 0;
     zxdg_decoration_manager_v1* decorationManager = nullptr;
+    wp_cursor_shape_manager_v1* cursorShapeManager = nullptr;
+
+    // Input from the parent's seat.
+    wl_seat* seat = nullptr;
+    wl_pointer* pointer = nullptr;
+    wl_keyboard* keyboard = nullptr;
+    wp_cursor_shape_device_v1* cursorShape = nullptr;
+    Output* pointerOutput = nullptr; // the window the pointer is over
+    std::set<std::uint32_t> pressedKeys;
+    PointerAxisEvent pendingAxis[2];    // vertical, horizontal; flushed on frame
+    bool axisPending[2] = {false, false};
 
     // What the parent can import: DRM format -> modifiers.
     std::map<std::uint32_t, std::vector<std::uint64_t>> formats;
@@ -55,6 +70,16 @@ struct NestedBackend::Parent {
 
     ~Parent()
     {
+        if (cursorShape)
+            wp_cursor_shape_device_v1_destroy(cursorShape);
+        if (cursorShapeManager)
+            wp_cursor_shape_manager_v1_destroy(cursorShapeManager);
+        if (pointer)
+            wl_pointer_release(pointer);
+        if (keyboard)
+            wl_keyboard_release(keyboard);
+        if (seat)
+            wl_seat_release(seat);
         if (decorationManager)
             zxdg_decoration_manager_v1_destroy(decorationManager);
         if (dmabuf)
@@ -126,6 +151,148 @@ const zwp_linux_dmabuf_feedback_v1_listener kFeedbackListener = {
     .tranche_flags = [](void*, zwp_linux_dmabuf_feedback_v1*, std::uint32_t) {},
 };
 
+// ------------------------------------------------------------------- input --
+
+Output* outputForSurface(Parent& p, wl_surface* surface);
+
+void flushAxis(Parent& p)
+{
+    for (int i = 0; i < 2; ++i) {
+        if (p.axisPending[i])
+            p.backend->input.pointerAxis.emit(p.pendingAxis[i]);
+        p.axisPending[i] = false;
+        p.pendingAxis[i] = {};
+    }
+}
+
+PointerAxisEvent& axisFor(Parent& p, std::uint32_t axis)
+{
+    const int i = axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL ? 1 : 0;
+    p.axisPending[i] = true;
+    p.pendingAxis[i].horizontal = i == 1;
+    return p.pendingAxis[i];
+}
+
+const wl_pointer_listener kPointerListener = {
+    .enter =
+        [](void* data, wl_pointer* pointer, std::uint32_t serial, wl_surface* surface, wl_fixed_t x, wl_fixed_t y) {
+            auto& p = *static_cast<Parent*>(data);
+            p.pointerOutput = outputForSurface(p, surface);
+            // The parent draws the cursor over our window: ask for its plain arrow.
+            if (p.cursorShapeManager) {
+                if (!p.cursorShape)
+                    p.cursorShape = wp_cursor_shape_manager_v1_get_pointer(p.cursorShapeManager, pointer);
+                wp_cursor_shape_device_v1_set_shape(p.cursorShape, serial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+            }
+            if (p.pointerOutput)
+                p.backend->input.pointerMotionAbsolute.emit(p.pointerOutput, wl_fixed_to_double(x),
+                                                            wl_fixed_to_double(y), 0);
+        },
+    .leave =
+        [](void* data, wl_pointer*, std::uint32_t, wl_surface*) {
+            auto& p = *static_cast<Parent*>(data);
+            p.pointerOutput = nullptr;
+            p.backend->input.pointerLeft.emit();
+        },
+    .motion =
+        [](void* data, wl_pointer*, std::uint32_t time, wl_fixed_t x, wl_fixed_t y) {
+            auto& p = *static_cast<Parent*>(data);
+            if (p.pointerOutput)
+                p.backend->input.pointerMotionAbsolute.emit(p.pointerOutput, wl_fixed_to_double(x),
+                                                            wl_fixed_to_double(y), time);
+        },
+    .button =
+        [](void* data, wl_pointer*, std::uint32_t, std::uint32_t time, std::uint32_t button, std::uint32_t state) {
+            static_cast<Parent*>(data)->backend->input.pointerButton.emit(
+                button, state == WL_POINTER_BUTTON_STATE_PRESSED, time);
+        },
+    .axis =
+        [](void* data, wl_pointer*, std::uint32_t time, std::uint32_t axis, wl_fixed_t value) {
+            auto& e = axisFor(*static_cast<Parent*>(data), axis);
+            e.timeMs = time;
+            e.value += wl_fixed_to_double(value);
+        },
+    .frame =
+        [](void* data, wl_pointer*) {
+            auto& p = *static_cast<Parent*>(data);
+            flushAxis(p);
+            p.backend->input.pointerFrame.emit();
+        },
+    .axis_source =
+        [](void* data, wl_pointer*, std::uint32_t source) {
+            auto& p = *static_cast<Parent*>(data);
+            for (auto& e : p.pendingAxis)
+                e.source = PointerAxisEvent::Source(source);
+        },
+    .axis_stop =
+        [](void* data, wl_pointer*, std::uint32_t time, std::uint32_t axis) {
+            auto& e = axisFor(*static_cast<Parent*>(data), axis);
+            e.timeMs = time;
+            e.stop = true;
+        },
+    .axis_discrete = [](void*, wl_pointer*, std::uint32_t, std::int32_t) {}, // superseded by value120 (v8)
+    .axis_value120 =
+        [](void* data, wl_pointer*, std::uint32_t axis, std::int32_t value120) {
+            axisFor(*static_cast<Parent*>(data), axis).value120 += value120;
+        },
+    .axis_relative_direction = [](void*, wl_pointer*, std::uint32_t, std::uint32_t) {},
+};
+
+const wl_keyboard_listener kKeyboardListener = {
+    .keymap =
+        [](void* data, wl_keyboard*, std::uint32_t format, std::int32_t fd, std::uint32_t size) {
+            UniqueFd owned(fd);
+            if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size == 0)
+                return;
+            void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (map == MAP_FAILED)
+                return;
+            const std::string keymap(static_cast<const char*>(map), strnlen(static_cast<const char*>(map), size));
+            munmap(map, size);
+            static_cast<Parent*>(data)->backend->input.keymap.emit(keymap);
+        },
+    // Keys already held when focus arrives (e.g. the shortcut that switched
+    // to us) aren't replayed: they'd be presses nobody intended for our clients.
+    .enter = [](void*, wl_keyboard*, std::uint32_t, wl_surface*, wl_array*) {},
+    .leave =
+        [](void* data, wl_keyboard*, std::uint32_t, wl_surface*) {
+            // We won't see the releases: release everything ourselves.
+            auto& p = *static_cast<Parent*>(data);
+            auto keys = std::exchange(p.pressedKeys, {});
+            for (std::uint32_t key : keys)
+                p.backend->input.key.emit(key, false, 0);
+        },
+    .key =
+        [](void* data, wl_keyboard*, std::uint32_t, std::uint32_t time, std::uint32_t key, std::uint32_t state) {
+            auto& p = *static_cast<Parent*>(data);
+            const bool pressed = state != WL_KEYBOARD_KEY_STATE_RELEASED;
+            if (pressed && !p.pressedKeys.insert(key).second)
+                return; // key repeat events from newer parents: clients repeat on their own
+            if (!pressed)
+                p.pressedKeys.erase(key);
+            p.backend->input.key.emit(key, pressed, time);
+        },
+    .modifiers = [](void*, wl_keyboard*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+                    std::uint32_t) {}, // we track modifiers from the keys ourselves
+    .repeat_info = [](void*, wl_keyboard*, std::int32_t, std::int32_t) {},
+};
+
+const wl_seat_listener kSeatListener = {
+    .capabilities =
+        [](void* data, wl_seat* seat, std::uint32_t caps) {
+            auto& p = *static_cast<Parent*>(data);
+            if ((caps & WL_SEAT_CAPABILITY_POINTER) && !p.pointer) {
+                p.pointer = wl_seat_get_pointer(seat);
+                wl_pointer_add_listener(p.pointer, &kPointerListener, &p);
+            }
+            if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !p.keyboard) {
+                p.keyboard = wl_seat_get_keyboard(seat);
+                wl_keyboard_add_listener(p.keyboard, &kKeyboardListener, &p);
+            }
+        },
+    .name = [](void*, wl_seat*, const char*) {},
+};
+
 const wl_registry_listener kRegistryListener = {
     .global =
         [](void* data, wl_registry* registry, std::uint32_t name, const char* iface, std::uint32_t version) {
@@ -146,6 +313,12 @@ const wl_registry_listener kRegistryListener = {
             } else if (i == zxdg_decoration_manager_v1_interface.name) {
                 p->decorationManager =
                     static_cast<zxdg_decoration_manager_v1*>(bind(&zxdg_decoration_manager_v1_interface, 1));
+            } else if (i == wl_seat_interface.name && !p->seat && version >= 5) {
+                p->seat = static_cast<wl_seat*>(bind(&wl_seat_interface, 8));
+                wl_seat_add_listener(p->seat, &kSeatListener, p);
+            } else if (i == wp_cursor_shape_manager_v1_interface.name) {
+                p->cursorShapeManager =
+                    static_cast<wp_cursor_shape_manager_v1*>(bind(&wp_cursor_shape_manager_v1_interface, 1));
             }
         },
     .global_remove = [](void*, wl_registry*, std::uint32_t) {},
@@ -200,6 +373,7 @@ public:
     }
 
     std::string description() const override { return "DragonDE nested window " + name(); }
+    wl_surface* surface() const { return m_surface; }
 
     void present(SwapchainSlot& slot) override
     {
@@ -340,6 +514,15 @@ const wl_buffer_listener NestedOutput::kBufferListener = {
     .release = [](void* data, wl_buffer*) { Swapchain::release(*static_cast<SwapchainSlot*>(data)); },
 };
 
+Output* outputForSurface(Parent& p, wl_surface* surface)
+{
+    for (const auto& output : p.backend->outputs()) {
+        if (static_cast<NestedOutput*>(output.get())->surface() == surface)
+            return output.get();
+    }
+    return nullptr;
+}
+
 } // namespace
 
 // --------------------------------------------------------------- backend --
@@ -357,6 +540,7 @@ std::unique_ptr<NestedBackend> NestedBackend::connect(EventLoop& loop)
     std::unique_ptr<NestedBackend> backend(new NestedBackend(loop));
     backend->m_parent = std::make_unique<Parent>();
     Parent& p = *backend->m_parent;
+    p.backend = backend.get();
     p.display = display;
 
     p.registry = wl_display_get_registry(display);

@@ -46,7 +46,24 @@ public:
     // Bottom to top; each window is followed by its popups.
     std::vector<RenderItem> renderList() const;
 
+    // The topmost surface accepting input at `point` (global coordinates),
+    // honoring input regions and subsurfaces.
+    struct Hit {
+        Surface* surface = nullptr;
+        PointF local; // surface-local position
+    };
+    Hit surfaceAt(PointF point) const;
+    // Global position of any mapped surface's origin (windows, popups, subsurfaces).
+    std::optional<Point> originOf(Surface* surface) const;
+    // The window a surface belongs to (through subsurfaces and popups), if any.
+    Window* windowOf(Surface* surface) const;
+
+    // Raises the window and gives it keyboard focus (and the activated state).
+    void focus(Window* window);
+    Window* focusedWindow() const { return m_focused; }
+
     Signal<Window*> windowMapped;
+    Signal<Window*> focusChanged;
     Signal<Window*> windowUnmapped;
 
 private:
@@ -57,6 +74,11 @@ private:
     void unmapWindow(XdgToplevel* toplevel);
     std::optional<Point> surfaceOrigin(const XdgSurface* xdg) const;
     static XdgToplevel* rootToplevel(const XdgPopup* popup);
+    static Surface* rootSurface(Surface* surface); // up through subsurface parents
+    static bool hitTree(Surface* surface, Point origin, PointF point, Hit& hit);
+
+    Server& m_server;
+    Window* m_focused = nullptr;
 
     Rect m_area{0, 0, 1280, 720};
     int m_cascade = 0;

@@ -62,6 +62,10 @@ dragon_add_client_protocol(dragon_client_protocols
     ${WAYLAND_PROTOCOLS_DIR}/stable/linux-dmabuf/linux-dmabuf-v1.xml)
 dragon_add_client_protocol(dragon_client_protocols
     ${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml)
+dragon_add_client_protocol(dragon_client_protocols
+    ${WAYLAND_PROTOCOLS_DIR}/staging/cursor-shape/cursor-shape-v1.xml)
+# cursor-shape references zwp_tablet_tool_v2, so its tables must exist too.
+dragon_add_client_protocol(dragon_client_protocols ${WAYLAND_PROTOCOLS_DIR}/stable/tablet/tablet-v2.xml)
 
 # Backends: where outputs and input come from.
 add_library(dragon_backend STATIC
@@ -79,18 +83,22 @@ add_library(dragon_server STATIC
     Server.cpp
     protocols/Buffer.cpp
     protocols/Compositor.cpp
+    protocols/DataDevice.cpp
     protocols/LinuxDmabuf.cpp
     protocols/Output.cpp
+    protocols/Seat.cpp
     protocols/XdgShell.cpp
 )
+pkg_check_modules(XkbCommon REQUIRED IMPORTED_TARGET xkbcommon)
 target_link_libraries(dragon_server
     PUBLIC dragon_wayland dragon_backend
-    PRIVATE dragon::options
+    PRIVATE PkgConfig::XkbCommon dragon::options
 )
 
 # What's on screen: window placement, surface textures, per-output rendering.
 add_library(dragon_desktop STATIC
     desktop/Desktop.cpp
+    desktop/InputRouter.cpp
     desktop/OutputRenderer.cpp
     desktop/SurfaceTextures.cpp
 )

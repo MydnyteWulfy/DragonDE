@@ -13,6 +13,17 @@ struct Point {
     constexpr Point operator-(Point o) const { return {x - o.x, y - o.y}; }
 };
 
+// Sub-pixel position (pointer coordinates).
+struct PointF {
+    double x = 0.0;
+    double y = 0.0;
+
+    friend constexpr bool operator==(PointF, PointF) = default;
+    constexpr PointF operator+(PointF o) const { return {x + o.x, y + o.y}; }
+    constexpr PointF operator-(PointF o) const { return {x - o.x, y - o.y}; }
+    constexpr PointF operator-(Point o) const { return {x - o.x, y - o.y}; }
+};
+
 struct Size {
     std::int32_t width = 0;
     std::int32_t height = 0;

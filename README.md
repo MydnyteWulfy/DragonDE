@@ -4,9 +4,10 @@ A Wayland desktop environment written from scratch in C++23: own compositor
 (no wlroots), Vulkan renderer, Qt Quick shell. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
-**Status:** M0 complete; M1 in progress (stages 1–3 of 5 done). Apps show up
-and animate, including GPU-rendered ones like kitty (zero-copy dma-buf).
-Keyboard and mouse input come next.
+**Status:** M0 complete; M1 in progress (stages 1–4 of 5 done). Apps show up,
+including GPU-rendered ones like kitty (zero-copy dma-buf), and take keyboard
+and mouse input: click to focus, typing, scrolling, copy/paste between apps.
+Window management (moving, keybindings) comes next.
 
 ## Build
 
@@ -36,6 +37,7 @@ them at the socket it prints (usually `wayland-1`):
 
 ```sh
 WAYLAND_DISPLAY=wayland-1 kitty
+WAYLAND_DISPLAY=wayland-1 foot
 WAYLAND_DISPLAY=wayland-1 ./build/debug/tools/demo-client/dragon-demo-client
 ```
 
@@ -53,10 +55,10 @@ Close the window or press Ctrl+C to quit.
 |------|------|
 | `compositor/core` | Event loop, signals, logging, geometry/regions |
 | `compositor/wayland` | Protocol object model (`Resource`, `Global`) |
-| `compositor/protocols` | Protocol implementations: surfaces, subsurfaces, shm/dma-buf buffers, outputs, xdg-shell |
+| `compositor/protocols` | Protocol implementations: surfaces, subsurfaces, shm/dma-buf buffers, outputs, xdg-shell, seat, clipboard |
 | `compositor/render` | GBM allocation, dma-buf sync, swapchains, Vulkan renderer |
 | `compositor/backend` | Nested (window in a parent compositor) and headless backends |
-| `compositor/desktop` | Window placement, surface textures, per-output rendering |
+| `compositor/desktop` | Window placement and focus, input routing, surface textures, per-output rendering |
 | `tools/scanner` | `dragon-scanner`: protocol XML → C++ |
 | `tools/demo-client` | Minimal animated wl_shm client for manual testing |
 | `tests` | GoogleTest suite (GPU tests skip without a GPU) |

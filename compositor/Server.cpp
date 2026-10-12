@@ -4,8 +4,10 @@
 #include "core/EventLoop.h"
 #include "core/Log.h"
 #include "protocols/Compositor.h"
+#include "protocols/DataDevice.h"
 #include "protocols/LinuxDmabuf.h"
 #include "protocols/Output.h"
+#include "protocols/Seat.h"
 #include "protocols/XdgShell.h"
 
 #include <algorithm>
@@ -18,6 +20,7 @@ namespace {
 constexpr std::uint32_t kCompositorVersion = 6;
 constexpr std::uint32_t kSubcompositorVersion = 1;
 constexpr std::uint32_t kXdgWmBaseVersion = 6;
+constexpr std::uint32_t kDataDeviceManagerVersion = 3;
 } // namespace
 
 Server::Server(wl_display* display, EventLoop& loop) : m_display(display), m_loop(loop)
@@ -33,6 +36,12 @@ Server::Server(wl_display* display, EventLoop& loop) : m_display(display), m_loo
     m_xdgWmBase = Global::create<proto::XdgWmBase>(
         display, kXdgWmBaseVersion, [this](wl_client* client, std::uint32_t version, std::uint32_t id) {
             makeResource<XdgWmBase>(client, version, id, *this);
+        });
+
+    m_seat = std::make_unique<Seat>(*this);
+    m_dataDeviceManager = Global::create<proto::WlDataDeviceManager>(
+        display, kDataDeviceManagerVersion, [this](wl_client* client, std::uint32_t version, std::uint32_t id) {
+            makeResource<DataDeviceManager>(client, version, id, *m_seat);
         });
 
     // wl_shm comes from libwayland: it already guards against clients

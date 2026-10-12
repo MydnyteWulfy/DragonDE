@@ -16,6 +16,7 @@ class EventLoop;
 class LinuxDmabuf;
 class Output;
 class OutputGlobal;
+class Seat;
 class Surface;
 class XdgPopup;
 class XdgToplevel;
@@ -40,6 +41,8 @@ public:
     void removeOutput(Output& output);
     OutputGlobal* outputGlobal(const Output& output) const;
 
+    Seat& seat() const { return *m_seat; }
+
     Signal<Surface*> surfaceCreated;
     Signal<XdgToplevel*> toplevelCreated;
     Signal<XdgPopup*> popupCreated;
@@ -51,6 +54,8 @@ private:
     std::unique_ptr<Global> m_subcompositor;
     std::unique_ptr<Global> m_xdgWmBase;
     std::unique_ptr<LinuxDmabuf> m_dmabuf;
+    std::unique_ptr<Seat> m_seat;
+    std::unique_ptr<Global> m_dataDeviceManager;
     std::vector<std::unique_ptr<OutputGlobal>> m_outputs;
     Connection m_flush;
 };

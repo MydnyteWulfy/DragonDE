@@ -4,6 +4,7 @@
 #include "core/EventLoop.h"
 #include "core/Log.h"
 #include "desktop/Desktop.h"
+#include "desktop/InputRouter.h"
 #include "desktop/OutputRenderer.h"
 #include "desktop/SurfaceTextures.h"
 #include "protocols/LinuxDmabuf.h"
@@ -137,6 +138,7 @@ int main()
         server.removeOutput(*output);
     });
     auto backendQuit = backend->quitRequested.connect(quit);
+    InputRouter input(*backend, desktop, server.seat());
 
     if (!backend->start(*gpu))
         return EXIT_FAILURE;
