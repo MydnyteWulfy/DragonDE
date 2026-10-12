@@ -188,11 +188,15 @@ DRM details planned up front:
 - Hit-testing for input uses the same tree, so what you see is what you click.
 
 ### 3.5 Wayland protocol layer
-- **`dragon-scanner`**: our own generator that turns protocol XML into C++
-  classes (`class XdgToplevel : public Resource<xdg_toplevel>` with virtual
-  request handlers and typed event senders). It's comparable to
-  qtwaylandscanner and hyprwayland-scanner, and it replaces hand-written
-  `wl_*_interface` boilerplate. About 1–2k lines of code, built first.
+- **`dragon-scanner`** (`tools/scanner`): generates C++ classes from protocol
+  XML, layered on top of `wayland-scanner`'s C output. The C side keeps doing
+  message encoding (implementation structs, `*_send_*`, `wl_interface` tables);
+  we generate one class per interface deriving from `dragon::Resource`:
+  `virtual handleX(...)` per request (typed: enums, `double` for fixed,
+  `string_view` for strings), `sendX(...)` per event (dropped if newer than the
+  bound version), `fromResource()`, and `enum class` types with bitfield
+  operators. Object lifetime is tied to the `wl_resource`. Wired up with
+  `dragon_add_protocol()` in `cmake/DragonProtocols.cmake`.
 - Protocol XML comes from the system `wayland-protocols` (1.49 installed), plus
   vendored wlr-protocols for the de-facto standards.
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(DragonDE VERSION 0.0.1 LANGUAGES CXX)
+project(DragonDE VERSION 0.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,7 +17,9 @@ include(cmake/DragonCompileOptions.cmake)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WaylandServer REQUIRED IMPORTED_TARGET wayland-server>=1.23)
+include(cmake/DragonProtocols.cmake)
 
+add_subdirectory(tools/scanner)
 add_subdirectory(compositor)
 
 if(DRAGON_BUILD_TESTS)

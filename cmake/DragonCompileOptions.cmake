@@ -4,9 +4,8 @@ add_library(dragon_options INTERFACE)
 add_library(dragon::options ALIAS dragon_options)
 
 target_compile_options(dragon_options INTERFACE
-    -Wall -Wextra -Wpedantic
-    -Wshadow -Wnon-virtual-dtor -Woverloaded-virtual
-    -Wnull-dereference -Wimplicit-fallthrough
+    -Wall -Wextra -Wpedantic -Wshadow -Wnull-dereference -Wimplicit-fallthrough
+    $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor -Woverloaded-virtual>
     $<$<CONFIG:Debug>:-g3 -fno-omit-frame-pointer>
 )
 
