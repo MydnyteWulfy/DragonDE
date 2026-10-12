@@ -6,7 +6,9 @@
 #include "desktop/Desktop.h"
 #include "desktop/OutputRenderer.h"
 #include "desktop/SurfaceTextures.h"
+#include "protocols/LinuxDmabuf.h"
 #include "render/Gpu.h"
+#include "render/vulkan/VulkanTexture.h"
 
 #include <csignal>
 #include <cstdlib>
@@ -108,6 +110,14 @@ int main()
     }
 
     textures = std::make_unique<SurfaceTextures>(server, *gpu);
+
+    // Clients render on our GPU and share buffers as dma-bufs (zero-copy).
+    DmabufSupport dmabuf{gpu->device(), {}, [&gpu](const DmaBuf& buf) {
+                             return gpu->renderer().importTexture(buf) != nullptr; // trial import
+                         }};
+    for (auto [format, modifier] : gpu->sampleFormats())
+        dmabuf.formats.push_back({format, modifier});
+    server.enableDmabuf(std::move(dmabuf));
 
     // One output for now: new windows go in the middle of the first one.
     Connection areaFollowsMode;

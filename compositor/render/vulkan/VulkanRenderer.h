@@ -8,7 +8,14 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <vector>
 #include <vulkan/vulkan.h>
+
+#include "core/UniqueFd.h"
+
+namespace dragon {
+struct DmaBuf;
+}
 
 namespace dragon::vk {
 
@@ -42,6 +49,8 @@ public:
 
     std::unique_ptr<VulkanTexture> createTexture(std::uint32_t width, std::uint32_t height, VkFormat format,
                                                  bool opaque);
+    // Zero-copy texture over a client's dma-buf. Null if Vulkan can't import it.
+    std::unique_ptr<VulkanTexture> importTexture(const DmaBuf& buffer);
 
     // Clears `target`, then draws `draws` in order (premultiplied alpha blending).
     bool render(VulkanImage& target, std::array<float, 4> clearColor, std::span<const TextureDraw> draws);
@@ -59,8 +68,9 @@ private:
     bool init();
     bool createPipelineLayout();
     VkPipeline pipelineFor(VkFormat format);
-    bool importWaitSemaphore(VulkanImage& target);
-    bool submit(VulkanImage& target, bool waitOnBuffer);
+    bool importSyncFile(VkSemaphore semaphore, UniqueFd syncFile);
+    bool submit(VulkanImage& target, std::span<const VkSemaphoreSubmitInfo> waits,
+                std::span<VulkanTexture* const> imported);
 
     VulkanDevice& m_device;
     VkCommandPool m_pool = VK_NULL_HANDLE;
@@ -68,6 +78,7 @@ private:
     VkFence m_fence = VK_NULL_HANDLE;               // CPU knows when the frame is done
     VkSemaphore m_waitSemaphore = VK_NULL_HANDLE;   // imported from the buffer's sync_file
     VkSemaphore m_signalSemaphore = VK_NULL_HANDLE; // exported as a sync_file into the buffer
+    std::vector<VkSemaphore> m_textureWaits;        // one per imported texture in a frame
     std::uint64_t m_submitted = 0;
 
     VkSampler m_sampler = VK_NULL_HANDLE;

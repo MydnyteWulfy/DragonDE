@@ -1,12 +1,15 @@
 #pragma once
 
 #include "core/Geometry.h"
+#include "core/Signal.h"
 
 #include <cstdint>
 #include <utility>
 #include <wayland-server-core.h>
 
 namespace dragon {
+
+struct DmaBuf;
 
 // Our view of a client's wl_buffer, whatever created it (wl_shm via
 // libwayland, linux-dmabuf via us). Created on first use and kept until the
@@ -32,13 +35,19 @@ public:
     wl_resource* resource() const { return m_resource; }
     // Kind::Shm only; null once destroyed. Wrap reads in wl_shm_buffer_begin/end_access.
     wl_shm_buffer* shmBuffer() const;
+    // Kind::DmaBuf only; null once destroyed (importers keep their own fds).
+    const DmaBuf* dmabuf() const;
+
+    // The wrapper is going away (wl_buffer destroyed and no locks left):
+    // drop anything cached for it, like imported textures.
+    Signal<> destroyed;
 
     void lock() { ++m_locks; }
     void unlock();
 
 private:
     ClientBuffer(wl_resource* resource, Kind kind, Size size, std::uint32_t format);
-    ~ClientBuffer() = default;
+    ~ClientBuffer() { destroyed.emit(); }
 
     static void handleResourceDestroy(wl_listener* listener, void* data);
 

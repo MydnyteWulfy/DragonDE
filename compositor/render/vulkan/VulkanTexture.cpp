@@ -2,6 +2,7 @@
 
 #include "core/Log.h"
 #include "render/vulkan/VulkanDevice.h"
+#include "render/vulkan/VulkanImage.h"
 #include "render/vulkan/VulkanRenderer.h"
 
 #include <algorithm>
@@ -93,6 +94,8 @@ VulkanTexture::~VulkanTexture()
 {
     if (m_lastUsedFrame > m_renderer.completedFrame())
         m_renderer.waitIdle();
+    if (m_imported)
+        return; // VulkanImage cleans up
     VkDevice dev = m_renderer.device().device();
     vkDestroyImageView(dev, m_view, nullptr);
     vkDestroyImage(dev, m_image, nullptr);
@@ -101,8 +104,15 @@ VulkanTexture::~VulkanTexture()
     vkFreeMemory(dev, m_stagingMemory, nullptr);
 }
 
+int VulkanTexture::dmabufFd() const
+{
+    return m_imported ? m_imported->dmabufFd() : -1;
+}
+
 void VulkanTexture::write(const void* data, std::uint32_t stride, std::span<const Rect> rects)
 {
+    if (m_imported)
+        return;
     // An in-flight frame may still be copying out of the staging buffer.
     if (m_lastUsedFrame > m_renderer.completedFrame())
         m_renderer.waitIdle();

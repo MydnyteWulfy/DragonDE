@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <sys/types.h>
 #include <vector>
 
@@ -25,8 +26,13 @@ public:
     vk::VulkanDevice& vulkan() { return *m_vulkan; }
     vk::VulkanRenderer& renderer() { return *m_renderer; }
 
+    // The render node this GPU was opened on.
+    dev_t device() const { return m_device; }
+
     // Modifiers we can render into for a DRM format (empty if unsupported).
     std::vector<std::uint64_t> renderModifiers(std::uint32_t drmFormat) const;
+    // Format/modifier pairs we can import and sample (client dma-bufs).
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> sampleFormats() const;
 
 private:
     Gpu() = default;
@@ -35,6 +41,7 @@ private:
     std::unique_ptr<GbmAllocator> m_allocator;
     std::unique_ptr<vk::VulkanDevice> m_vulkan;
     std::unique_ptr<vk::VulkanRenderer> m_renderer;
+    dev_t m_device = 0;
 };
 
 } // namespace dragon

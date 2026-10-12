@@ -2,10 +2,12 @@
 
 #include "core/Log.h"
 #include "render/DmaBuf.h"
+#include "render/vulkan/Formats.h"
 #include "render/vulkan/VulkanDevice.h"
 #include "render/vulkan/VulkanImage.h"
 #include "render/vulkan/VulkanTexture.h"
 
+#include <algorithm>
 #include <bit>
 
 namespace dragon::vk {
@@ -62,6 +64,8 @@ VulkanRenderer::~VulkanRenderer()
     vkDestroyPipelineLayout(dev, m_pipelineLayout, nullptr);
     vkDestroyDescriptorSetLayout(dev, m_setLayout, nullptr);
     vkDestroySampler(dev, m_sampler, nullptr);
+    for (VkSemaphore sem : m_textureWaits)
+        vkDestroySemaphore(dev, sem, nullptr);
     vkDestroySemaphore(dev, m_signalSemaphore, nullptr);
     vkDestroySemaphore(dev, m_waitSemaphore, nullptr);
     vkDestroyFence(dev, m_fence, nullptr);
@@ -267,16 +271,13 @@ bool VulkanRenderer::waitIdle(std::chrono::nanoseconds timeout)
     return check(r, "vkWaitForFences");
 }
 
-bool VulkanRenderer::importWaitSemaphore(VulkanImage& target)
+bool VulkanRenderer::importSyncFile(VkSemaphore semaphore, UniqueFd syncFile)
 {
-    // Writing, so wait for everyone (readers and writers) still using the buffer.
-    UniqueFd syncFile = dmabuf::exportSyncFile(target.dmabufFd(), dmabuf::Access::Write);
     if (!syncFile)
         return false;
-
     VkImportSemaphoreFdInfoKHR info{
         .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
-        .semaphore = m_waitSemaphore,
+        .semaphore = semaphore,
         .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT, // required for SYNC_FD; payload consumed by one wait
         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
         .fd = syncFile.get(),
@@ -287,13 +288,53 @@ bool VulkanRenderer::importWaitSemaphore(VulkanImage& target)
     return true;
 }
 
+std::unique_ptr<VulkanTexture> VulkanRenderer::importTexture(const DmaBuf& buffer)
+{
+    auto image = VulkanImage::importDmaBuf(m_device, buffer, VK_IMAGE_USAGE_SAMPLED_BIT, "client dma-buf");
+    if (!image)
+        return nullptr;
+    std::unique_ptr<VulkanTexture> tex(new VulkanTexture(*this));
+    tex->m_width = buffer.width;
+    tex->m_height = buffer.height;
+    tex->m_format = image->format();
+    tex->m_opaque = !drmFormatHasAlpha(buffer.format);
+    tex->m_image = image->image();
+    tex->m_view = image->view();
+    tex->m_imported = std::move(image);
+    return tex;
+}
+
 bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std::span<const TextureDraw> draws)
 {
     // One frame in flight for now; the frame pacing work will add more.
     if (!waitIdle())
         return false;
 
-    const bool waitOnBuffer = importWaitSemaphore(target);
+    std::vector<VkSemaphoreSubmitInfo> waits;
+
+    // Our target: writing, so wait for everyone (readers and writers) still using it.
+    if (importSyncFile(m_waitSemaphore, dmabuf::exportSyncFile(target.dmabufFd(), dmabuf::Access::Write)))
+        waits.push_back({.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = m_waitSemaphore,
+                         .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT});
+
+    // Client dma-bufs: reading, so wait for the client's rendering (writers) only.
+    std::vector<VulkanTexture*> imported;
+    for (const auto& d : draws) {
+        if (d.texture->imported() && std::ranges::find(imported, d.texture) == imported.end())
+            imported.push_back(d.texture);
+    }
+    while (m_textureWaits.size() < imported.size()) {
+        VkSemaphoreCreateInfo info{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        VkSemaphore sem = VK_NULL_HANDLE;
+        if (!check(vkCreateSemaphore(m_device.device(), &info, nullptr, &sem), "vkCreateSemaphore(texture wait)"))
+            return false;
+        m_textureWaits.push_back(sem);
+    }
+    for (std::size_t i = 0; i < imported.size(); ++i) {
+        if (importSyncFile(m_textureWaits[i], dmabuf::exportSyncFile(imported[i]->dmabufFd(), dmabuf::Access::Read)))
+            waits.push_back({.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = m_textureWaits[i],
+                             .stageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT});
+    }
 
     vkResetCommandBuffer(m_cmd, 0);
     VkCommandBufferBeginInfo begin{
@@ -306,8 +347,10 @@ bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std:
     for (const auto& d : draws)
         d.texture->recordUpload(m_cmd, frame);
 
-    // Acquire from FOREIGN. UNDEFINED old layout: we overwrite every pixel.
-    VkImageMemoryBarrier2 acquire{
+    // Acquire everything other processes own: our target (UNDEFINED: we
+    // overwrite every pixel) and client images (GENERAL: keep their content).
+    std::vector<VkImageMemoryBarrier2> acquire;
+    acquire.push_back({
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, // chains with the semaphore wait
         .srcAccessMask = VK_ACCESS_2_NONE,
@@ -319,11 +362,26 @@ bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std:
         .dstQueueFamilyIndex = m_device.queueFamily(),
         .image = target.image(),
         .subresourceRange = kColorRange,
-    };
+    });
+    for (auto* tex : imported) {
+        acquire.push_back({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_NONE,
+            .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+            .dstQueueFamilyIndex = m_device.queueFamily(),
+            .image = tex->m_image,
+            .subresourceRange = kColorRange,
+        });
+    }
     VkDependencyInfo acquireDep{
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &acquire,
+        .imageMemoryBarrierCount = std::uint32_t(acquire.size()),
+        .pImageMemoryBarriers = acquire.data(),
     };
     vkCmdPipelineBarrier2(m_cmd, &acquireDep);
 
@@ -387,8 +445,9 @@ bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std:
 
     vkCmdEndRendering(m_cmd);
 
-    // Release to FOREIGN in GENERAL, the layout external consumers expect.
-    VkImageMemoryBarrier2 release{
+    // Hand everything back to FOREIGN in GENERAL, the layout other processes expect.
+    std::vector<VkImageMemoryBarrier2> release;
+    release.push_back({
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
         .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -400,26 +459,37 @@ bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std:
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
         .image = target.image(),
         .subresourceRange = kColorRange,
-    };
+    });
+    for (auto* tex : imported) {
+        release.push_back({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_NONE, // reads only: nothing to flush
+            .dstStageMask = VK_PIPELINE_STAGE_2_NONE,
+            .dstAccessMask = VK_ACCESS_2_NONE,
+            .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = m_device.queueFamily(),
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
+            .image = tex->m_image,
+            .subresourceRange = kColorRange,
+        });
+    }
     VkDependencyInfo releaseDep{
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &release,
+        .imageMemoryBarrierCount = std::uint32_t(release.size()),
+        .pImageMemoryBarriers = release.data(),
     };
     vkCmdPipelineBarrier2(m_cmd, &releaseDep);
 
     if (!check(vkEndCommandBuffer(m_cmd), "vkEndCommandBuffer"))
         return false;
-    return submit(target, waitOnBuffer);
+    return submit(target, waits, imported);
 }
 
-bool VulkanRenderer::submit(VulkanImage& target, bool waitOnBuffer)
+bool VulkanRenderer::submit(VulkanImage& target, std::span<const VkSemaphoreSubmitInfo> waits,
+                            std::span<VulkanTexture* const> imported)
 {
-    VkSemaphoreSubmitInfo wait{
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = m_waitSemaphore,
-        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-    };
     VkSemaphoreSubmitInfo signal{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
         .semaphore = m_signalSemaphore,
@@ -428,8 +498,8 @@ bool VulkanRenderer::submit(VulkanImage& target, bool waitOnBuffer)
     VkCommandBufferSubmitInfo cmd{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = m_cmd};
     VkSubmitInfo2 submit{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .waitSemaphoreInfoCount = waitOnBuffer ? 1u : 0u,
-        .pWaitSemaphoreInfos = &wait,
+        .waitSemaphoreInfoCount = std::uint32_t(waits.size()),
+        .pWaitSemaphoreInfos = waits.data(),
         .commandBufferInfoCount = 1,
         .pCommandBufferInfos = &cmd,
         .signalSemaphoreInfoCount = 1,
@@ -442,8 +512,9 @@ bool VulkanRenderer::submit(VulkanImage& target, bool waitOnBuffer)
         return false;
     ++m_submitted;
 
-    // Hand our completion to implicit sync: the next reader of the dma-buf
-    // (KMS, the parent compositor) waits for it in the kernel.
+    // Hand our completion to implicit sync: the next user of each dma-buf
+    // waits for it in the kernel (KMS / the parent compositor for the target,
+    // the client's next render into the buffers we sampled).
     VkSemaphoreGetFdInfoKHR getFd{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
         .semaphore = m_signalSemaphore,
@@ -453,8 +524,11 @@ bool VulkanRenderer::submit(VulkanImage& target, bool waitOnBuffer)
     if (!check(m_device.fn().getSemaphoreFdKHR(m_device.device(), &getFd, &fd), "vkGetSemaphoreFdKHR"))
         return false;
     UniqueFd syncFile(fd); // -1 means "already signaled", nothing to attach
-    if (syncFile)
+    if (syncFile) {
         dmabuf::importSyncFile(target.dmabufFd(), syncFile.get(), dmabuf::Access::Write);
+        for (auto* tex : imported)
+            dmabuf::importSyncFile(tex->dmabufFd(), syncFile.get(), dmabuf::Access::Read);
+    }
     return true;
 }
 

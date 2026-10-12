@@ -7,6 +7,7 @@
 
 namespace dragon {
 
+class ClientBuffer;
 class Gpu;
 class Server;
 class Surface;
@@ -16,7 +17,8 @@ class VulkanTexture;
 
 // Keeps a GPU texture for every surface with content. wl_shm buffers are
 // copied on commit (only the damaged part) and released to the client
-// immediately; dma-buf import arrives in M1 stage 3.
+// immediately. dma-bufs are imported zero-copy, once per wl_buffer (clients
+// cycle through a few), and stay locked while on screen.
 class SurfaceTextures {
 public:
     SurfaceTextures(Server& server, Gpu& gpu);
@@ -29,11 +31,15 @@ public:
 
 private:
     struct Entry;
+    struct Imported;
     void track(Surface* surface);
     void update(Surface* surface, Entry& entry);
+    void updateShm(Surface* surface, Entry& entry, ClientBuffer* buffer);
+    void updateDmabuf(Entry& entry, ClientBuffer* buffer);
 
     Gpu& m_gpu;
     std::unordered_map<Surface*, std::unique_ptr<Entry>> m_entries;
+    std::unordered_map<ClientBuffer*, std::unique_ptr<Imported>> m_imported;
     Connection m_surfaceCreated;
 };
 

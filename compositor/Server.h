@@ -11,7 +11,9 @@ struct wl_display;
 
 namespace dragon {
 
+struct DmabufSupport;
 class EventLoop;
+class LinuxDmabuf;
 class Output;
 class OutputGlobal;
 class Surface;
@@ -31,6 +33,9 @@ public:
     EventLoop& loop() const { return m_loop; }
     std::uint32_t nextSerial();
 
+    // Advertises zwp_linux_dmabuf_v1 once the renderer knows what it can import.
+    void enableDmabuf(DmabufSupport support);
+
     void addOutput(Output& output);
     void removeOutput(Output& output);
     OutputGlobal* outputGlobal(const Output& output) const;
@@ -45,6 +50,7 @@ private:
     std::unique_ptr<Global> m_compositor;
     std::unique_ptr<Global> m_subcompositor;
     std::unique_ptr<Global> m_xdgWmBase;
+    std::unique_ptr<LinuxDmabuf> m_dmabuf;
     std::vector<std::unique_ptr<OutputGlobal>> m_outputs;
     Connection m_flush;
 };

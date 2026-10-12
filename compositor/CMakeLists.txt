@@ -79,6 +79,7 @@ add_library(dragon_server STATIC
     Server.cpp
     protocols/Buffer.cpp
     protocols/Compositor.cpp
+    protocols/LinuxDmabuf.cpp
     protocols/Output.cpp
     protocols/XdgShell.cpp
 )

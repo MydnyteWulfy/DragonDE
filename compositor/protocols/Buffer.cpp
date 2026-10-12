@@ -1,5 +1,7 @@
 #include "protocols/Buffer.h"
 
+#include "protocols/LinuxDmabuf.h"
+
 #include <drm_fourcc.h>
 #include <wayland-server-protocol.h>
 
@@ -28,6 +30,11 @@ ClientBuffer* ClientBuffer::get(wl_resource* buffer)
         return new ClientBuffer(buffer, Kind::Shm, {wl_shm_buffer_get_width(shm), wl_shm_buffer_get_height(shm)},
                                 shmFormatToDrm(wl_shm_buffer_get_format(shm)));
     }
+    if (auto* d = DmabufBuffer::from(buffer)) {
+        const DmaBuf& buf = d->dmabuf();
+        return new ClientBuffer(buffer, Kind::DmaBuf, {std::int32_t(buf.width), std::int32_t(buf.height)},
+                                buf.format);
+    }
     return nullptr;
 }
 
@@ -42,6 +49,14 @@ ClientBuffer::ClientBuffer(wl_resource* resource, Kind kind, Size size, std::uin
 wl_shm_buffer* ClientBuffer::shmBuffer() const
 {
     return m_kind == Kind::Shm && m_resource ? wl_shm_buffer_get(m_resource) : nullptr;
+}
+
+const DmaBuf* ClientBuffer::dmabuf() const
+{
+    if (m_kind != Kind::DmaBuf || !m_resource)
+        return nullptr;
+    auto* d = DmabufBuffer::from(m_resource);
+    return d ? &d->dmabuf() : nullptr;
 }
 
 void ClientBuffer::unlock()

@@ -4,6 +4,7 @@
 #include "core/EventLoop.h"
 #include "core/Log.h"
 #include "protocols/Compositor.h"
+#include "protocols/LinuxDmabuf.h"
 #include "protocols/Output.h"
 #include "protocols/XdgShell.h"
 
@@ -50,6 +51,11 @@ Server::~Server() = default;
 std::uint32_t Server::nextSerial()
 {
     return wl_display_next_serial(m_display);
+}
+
+void Server::enableDmabuf(DmabufSupport support)
+{
+    m_dmabuf = std::make_unique<LinuxDmabuf>(*this, std::move(support));
 }
 
 void Server::addOutput(Output& output)

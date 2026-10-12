@@ -1,8 +1,10 @@
 #pragma once
 
 #include "core/Geometry.h"
+#include "render/vulkan/VulkanImage.h"
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 #include <vulkan/vulkan.h>
@@ -11,9 +13,12 @@ namespace dragon::vk {
 
 class VulkanRenderer;
 
-// A GPU texture filled from CPU memory (wl_shm buffers). write() copies the
-// changed pixels into a staging buffer right away, so the client can reuse its
-// buffer; the GPU copy into the image is recorded with the next frame.
+// A texture the renderer can draw. Two kinds:
+//  - owned (wl_shm): write() copies changed pixels into a staging buffer right
+//    away, so the client can reuse its buffer; the GPU copy into the image is
+//    recorded with the next frame.
+//  - imported (client dma-buf): zero-copy; each frame waits for the client's
+//    implicit write fence and takes the image from VK_QUEUE_FAMILY_FOREIGN_EXT.
 class VulkanTexture {
 public:
     ~VulkanTexture();
@@ -31,7 +36,14 @@ public:
     void write(const void* data, std::uint32_t stride, std::span<const Rect> rects);
 
     // True once the image holds content and can be sampled.
-    bool ready() const { return m_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || !m_pending.empty(); }
+    bool ready() const
+    {
+        return imported() || m_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || !m_pending.empty();
+    }
+
+    bool imported() const { return m_imported != nullptr; }
+    // Imported only: the dma-buf whose implicit fences we wait on / signal.
+    int dmabufFd() const;
 
 private:
     friend class VulkanRenderer;
@@ -58,6 +70,7 @@ private:
     std::vector<VkBufferImageCopy> m_pending;
 
     std::uint64_t m_lastUsedFrame = 0; // last frame that read the image or the staging buffer
+    std::unique_ptr<VulkanImage> m_imported; // owns image/view/memory when imported
 };
 
 } // namespace dragon::vk
