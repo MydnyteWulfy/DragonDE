@@ -8,17 +8,59 @@ target_link_libraries(dragon_core
     PRIVATE dragon::options
 )
 
-# Wayland object model + every generated protocol binding.
+# wl_interface tables for every protocol, shared by server and client code.
+add_library(dragon_protocol_tables STATIC)
+target_include_directories(dragon_protocol_tables PUBLIC ${DRAGON_PROTOCOL_ROOT} ${DRAGON_PROTOCOL_DIR})
+target_link_libraries(dragon_protocol_tables PUBLIC PkgConfig::WaylandServer)
+
+# Wayland object model + every generated server-side protocol binding.
 add_library(dragon_wayland STATIC
     wayland/Global.cpp
     wayland/Resource.cpp
 )
-target_include_directories(dragon_wayland PUBLIC ${DRAGON_PROTOCOL_ROOT} ${DRAGON_PROTOCOL_DIR})
-target_link_libraries(dragon_wayland PUBLIC dragon_core PRIVATE dragon::options)
+target_link_libraries(dragon_wayland PUBLIC dragon_core dragon_protocol_tables PRIVATE dragon::options)
 
 dragon_add_protocol(dragon_wayland ${WAYLAND_XML_DIR}/wayland.xml CORE SKIP wl_display wl_registry)
 dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
 dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/stable/linux-dmabuf/linux-dmabuf-v1.xml)
 
+# GPU: render node, GBM allocation, dma-buf sync, swapchains, Vulkan renderer.
+find_package(Vulkan REQUIRED)
+pkg_check_modules(Gbm REQUIRED IMPORTED_TARGET gbm)
+pkg_check_modules(LibDrm REQUIRED IMPORTED_TARGET libdrm)
+
+add_library(dragon_render STATIC
+    render/DmaBuf.cpp
+    render/GbmAllocator.cpp
+    render/Gpu.cpp
+    render/RenderNode.cpp
+    render/Swapchain.cpp
+    render/vulkan/Formats.cpp
+    render/vulkan/VulkanDevice.cpp
+    render/vulkan/VulkanImage.cpp
+    render/vulkan/VulkanRenderer.cpp
+)
+target_link_libraries(dragon_render
+    PUBLIC dragon_core Vulkan::Vulkan PkgConfig::Gbm PkgConfig::LibDrm
+    PRIVATE dragon::options
+)
+
+# Backends: where outputs and input come from.
+pkg_check_modules(WaylandClient REQUIRED IMPORTED_TARGET wayland-client)
+
+add_library(dragon_backend STATIC
+    backend/Backend.cpp
+    backend/headless/HeadlessBackend.cpp
+    backend/nested/NestedBackend.cpp
+)
+target_link_libraries(dragon_backend
+    PUBLIC dragon_render
+    PRIVATE dragon_protocol_tables PkgConfig::WaylandClient dragon::options
+)
+dragon_add_client_protocol(dragon_backend ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
+dragon_add_client_protocol(dragon_backend ${WAYLAND_PROTOCOLS_DIR}/stable/linux-dmabuf/linux-dmabuf-v1.xml)
+dragon_add_client_protocol(dragon_backend
+    ${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml)
+
 add_executable(dragon-compositor main.cpp)
-target_link_libraries(dragon-compositor PRIVATE dragon_wayland dragon::options)
+target_link_libraries(dragon-compositor PRIVATE dragon_backend dragon_wayland dragon::options)

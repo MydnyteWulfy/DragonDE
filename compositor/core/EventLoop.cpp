@@ -119,6 +119,9 @@ void EventLoop::addIdle(std::function<void()> cb)
 
 int EventLoop::dispatch(int timeoutMs)
 {
+    // Idle callbacks run first: they may produce output that needs flushing.
+    wl_event_loop_dispatch_idle(m_loop);
+    beforeSleep.emit();
     return wl_event_loop_dispatch(m_loop, timeoutMs);
 }
 

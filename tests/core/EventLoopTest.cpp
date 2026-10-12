@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <memory>
 #include <unistd.h>
+#include <vector>
 #include <wayland-server-core.h>
 
 using namespace std::chrono_literals;
@@ -70,4 +71,15 @@ TEST_F(LoopFixture, DestroyedSourceNeverFires)
     loop.dispatch(20);
 
     EXPECT_FALSE(fired);
+}
+
+TEST_F(LoopFixture, BeforeSleepRunsAfterIdleBeforeBlocking)
+{
+    std::vector<int> order;
+    loop.addIdle([&] { order.push_back(1); });
+    auto c = loop.beforeSleep.connect([&] { order.push_back(2); });
+
+    loop.dispatch(0);
+
+    EXPECT_EQ(order, (std::vector<int>{1, 2}));
 }

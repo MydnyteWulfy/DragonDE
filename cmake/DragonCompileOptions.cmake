@@ -5,6 +5,9 @@ add_library(dragon::options ALIAS dragon_options)
 
 target_compile_options(dragon_options INTERFACE
     -Wall -Wextra -Wpedantic -Wshadow -Wnull-dereference -Wimplicit-fallthrough
+    # Designated initializers that leave fields zeroed are the intended style
+    # for Vulkan/libwayland structs; -Wextra would flag every one of them.
+    -Wno-missing-field-initializers
     $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor -Woverloaded-virtual>
     $<$<CONFIG:Debug>:-g3 -fno-omit-frame-pointer>
 )

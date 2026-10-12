@@ -1,0 +1,61 @@
+#include "render/vulkan/Formats.h"
+
+#include <drm_fourcc.h>
+
+namespace dragon::vk {
+
+VkFormat formatFromDrm(std::uint32_t fourcc)
+{
+    switch (fourcc) {
+    case DRM_FORMAT_XRGB8888:
+    case DRM_FORMAT_ARGB8888: return VK_FORMAT_B8G8R8A8_UNORM;
+    case DRM_FORMAT_XBGR8888:
+    case DRM_FORMAT_ABGR8888: return VK_FORMAT_R8G8B8A8_UNORM;
+    case DRM_FORMAT_XRGB2101010:
+    case DRM_FORMAT_ARGB2101010: return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+    case DRM_FORMAT_XBGR2101010:
+    case DRM_FORMAT_ABGR2101010: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case DRM_FORMAT_XBGR16161616F:
+    case DRM_FORMAT_ABGR16161616F: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+bool drmFormatHasAlpha(std::uint32_t fourcc)
+{
+    switch (fourcc) {
+    case DRM_FORMAT_ARGB8888:
+    case DRM_FORMAT_ABGR8888:
+    case DRM_FORMAT_ARGB2101010:
+    case DRM_FORMAT_ABGR2101010:
+    case DRM_FORMAT_ABGR16161616F: return true;
+    default: return false;
+    }
+}
+
+const char* resultString(VkResult result)
+{
+    switch (result) {
+#define DRAGON_VK_RESULT(r) case r: return #r;
+        DRAGON_VK_RESULT(VK_SUCCESS)
+        DRAGON_VK_RESULT(VK_NOT_READY)
+        DRAGON_VK_RESULT(VK_TIMEOUT)
+        DRAGON_VK_RESULT(VK_INCOMPLETE)
+        DRAGON_VK_RESULT(VK_ERROR_OUT_OF_HOST_MEMORY)
+        DRAGON_VK_RESULT(VK_ERROR_OUT_OF_DEVICE_MEMORY)
+        DRAGON_VK_RESULT(VK_ERROR_INITIALIZATION_FAILED)
+        DRAGON_VK_RESULT(VK_ERROR_DEVICE_LOST)
+        DRAGON_VK_RESULT(VK_ERROR_MEMORY_MAP_FAILED)
+        DRAGON_VK_RESULT(VK_ERROR_LAYER_NOT_PRESENT)
+        DRAGON_VK_RESULT(VK_ERROR_EXTENSION_NOT_PRESENT)
+        DRAGON_VK_RESULT(VK_ERROR_FEATURE_NOT_PRESENT)
+        DRAGON_VK_RESULT(VK_ERROR_INCOMPATIBLE_DRIVER)
+        DRAGON_VK_RESULT(VK_ERROR_FORMAT_NOT_SUPPORTED)
+        DRAGON_VK_RESULT(VK_ERROR_INVALID_EXTERNAL_HANDLE)
+        DRAGON_VK_RESULT(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT)
+#undef DRAGON_VK_RESULT
+    default: return "VK_ERROR_<unknown>";
+    }
+}
+
+} // namespace dragon::vk

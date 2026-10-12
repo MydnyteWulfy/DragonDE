@@ -5,6 +5,8 @@
 #include <functional>
 #include <memory>
 
+#include "core/Signal.h"
+
 struct wl_event_loop;
 struct wl_event_source;
 
@@ -56,8 +58,13 @@ public:
     // One-shot: runs before the loop next sleeps.
     void addIdle(std::function<void()> cb);
 
-    // Dispatches pending events, waiting up to `timeout` (-1 = forever).
+    // Emits beforeSleep, then dispatches pending events, waiting up to
+    // `timeoutMs` (-1 = forever).
     int dispatch(int timeoutMs = -1);
+
+    // Last chance to flush buffered output (to clients, to a parent
+    // compositor) before the loop may block.
+    Signal<> beforeSleep;
 
 private:
     wl_event_loop* m_loop;

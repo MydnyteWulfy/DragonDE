@@ -1,6 +1,6 @@
 # DragonDE — Architecture Plan
 
-Status: draft v0.1 (2026-10-11)
+Status: v0.2 (2026-10-11) — M0 complete
 Language: C++23 · Build: CMake · Target: Arch Linux, Intel Arc (xe/Mesa) first
 
 ---
@@ -134,6 +134,13 @@ public:
 | **Nested** | Runs as an `xdg_toplevel` inside KDE. Each output is a window; input comes from the parent `wl_seat`. Fast iteration, no TTY switching. | 1st |
 | **Headless** | No display. Renders offscreen; used for automated tests/CI. | 1st |
 | **DRM**    | Real hardware: libseat session, KMS **atomic** API, GBM buffers, libinput, libdisplay-info for EDID, udev hotplug. | 3rd |
+
+Startup order (implemented in M0): create the backend → ask it for its
+preferred GPU (nested: the parent's dmabuf-feedback main device) → create the
+`Gpu` (render node + GBM + Vulkan) on that device → `backend.start(gpu)`
+creates outputs, each owning a `Swapchain` of GBM buffers. Outputs emit
+`frame` when it's time to draw; the render loop acquires a slot, renders,
+and calls `present()`.
 
 DRM details planned up front:
 - Atomic commits only (no legacy API); `TEST_ONLY` before every real commit.
@@ -313,7 +320,7 @@ DragonDE/
 
 | # | Milestone | Done when |
 |---|-----------|-----------|
-| **M0** | Skeleton | CMake builds; `dragon-scanner` generates bindings; core loop; Vulkan device + GBM-backed render targets with validation clean; nested backend opens a window and shows a Vulkan-cleared dmabuf; headless backend renders offscreen. |
+| **M0** ✅ | Skeleton | CMake builds; `dragon-scanner` generates bindings; core loop; Vulkan device + GBM-backed render targets with validation clean; nested backend opens a window and shows a Vulkan-cleared dmabuf; headless backend renders offscreen. |
 | **M1** | First pixels from clients | Tier 0 protocols. `foot` runs inside the nested compositor via `wl_shm`. Keyboard/pointer focus, move, close, Super+Enter to spawn terminal. |
 | **M2** | Real apps | Tier 1 + 1g. dmabuf zero-copy; damage tracking; SSD; fractional scale; multiple nested outputs. Qt, GTK4, Firefox, mpv, and a LunarEngine build all run correctly. |
 | **M3** | Bare metal | DRM backend with libseat; launch from TTY; VT switching; hotplug; cursor plane; frame scheduling; VRR. SDDM session entry. |
