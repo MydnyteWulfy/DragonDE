@@ -1,0 +1,6 @@
+/build/
+/.cache/
+CMakeUserPresets.json
+*.DotSettings.user
+.idea/
+.vscode/
