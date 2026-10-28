@@ -44,6 +44,7 @@ public:
     InputRouter& operator=(const InputRouter&) = delete;
 
     PointF pointerPosition() const { return m_pointer; }
+    bool pointerInside() const { return m_pointerInside; }
     bool grabbing() const { return m_grab.kind != GrabKind::None; }
 
 private:

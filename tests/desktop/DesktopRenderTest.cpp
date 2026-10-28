@@ -129,3 +129,21 @@ TEST_F(DesktopRenderTest, UnmappedWindowDisappears)
     EXPECT_TRUE(desktop->windows().empty());
     EXPECT_EQ(pixel(160, 120), background());
 }
+
+TEST_F(DesktopRenderTest, OverlayIsDrawnAboveWindows)
+{
+    auto w = makeWindow();
+    ASSERT_TRUE(roundtrip());
+    mapWindow(*w, 100, 100); // at (110, 70), default fill
+    auto* cursor = makeSurface();
+    wl_surface_attach(cursor, makeBuffer(8, 8, kGreen), 0, 0);
+    wl_surface_commit(cursor);
+    ASSERT_TRUE(roundtrip());
+    Surface* serverCursor = surfaces.back();
+
+    renderer->addOverlay([serverCursor] { return Desktop::RenderItem{serverCursor, {150, 100}}; });
+    pumpFrames(2);
+
+    EXPECT_EQ(pixel(152, 102), 0x00ff00u) << "on top of the window";
+    EXPECT_EQ(pixel(160, 120), 0x336699u);
+}

@@ -42,6 +42,10 @@ void OutputRenderer::render()
     m_drawn.clear();
     for (const auto& item : m_desktop.renderList())
         collect(item.surface, item.origin);
+    for (const auto& overlay : m_overlays) {
+        if (auto item = overlay())
+            collect(item->surface, item->origin);
+    }
 
     if (!m_gpu.renderer().render(*slot->image, kBackground, m_draws)) {
         Swapchain::release(*slot);

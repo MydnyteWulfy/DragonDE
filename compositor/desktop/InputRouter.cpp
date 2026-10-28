@@ -55,6 +55,14 @@ InputRouter::InputRouter(Backend& backend, Desktop& desktop, Seat& seat, WindowM
         updatePointerFocus(0, false);
     }));
 
+    // Drag and drop: report where the pointer is the moment a drag starts,
+    // and re-pick normal pointer focus when it ends.
+    m_connections.push_back(seat.dragStarted.connect([this] {
+        const auto hit = m_desktop.surfaceAt(m_pointer);
+        m_seat.dragMotion(hit.surface, hit.local, 0);
+    }));
+    m_connections.push_back(seat.dragEnded.connect([this] { updatePointerFocus(0, false); }));
+
     m_connections.push_back(desktop.moveRequested.connect([this](Desktop::Window* w, std::uint32_t serial) {
         if (clientGrabAllowed(serial))
             startGrab(GrabKind::Move, *w, m_lastClientButton, 0);
@@ -78,6 +86,11 @@ void InputRouter::key(std::uint32_t key, bool pressed, std::uint32_t timeMs)
 {
     if (!pressed && m_swallowedKeys.erase(key))
         return; // the release of a shortcut key
+    if (pressed && key == KEY_ESC && m_seat.dragActive()) {
+        m_seat.cancelDrag();
+        m_swallowedKeys.insert(key);
+        return;
+    }
     if (pressed && m_seat.modifierActive(m_config.modifier.c_str()) && runShortcut(key)) {
         m_swallowedKeys.insert(key);
         return;
@@ -118,7 +131,10 @@ void InputRouter::motion(PointF global, std::uint32_t timeMs)
     m_pointerInside = true;
     if (grabbing())
         updateGrab();
-    else
+    else if (m_seat.dragActive()) {
+        const auto hit = m_desktop.surfaceAt(m_pointer);
+        m_seat.dragMotion(hit.surface, hit.local, timeMs);
+    } else
         updatePointerFocus(timeMs, true);
 }
 
@@ -157,6 +173,16 @@ void InputRouter::button(std::uint32_t button, bool pressed, std::uint32_t timeM
     }
     if (!pressed && m_swallowedButtons.erase(button))
         return;
+
+    // Dragging: the release drops; other buttons do nothing meanwhile.
+    if (m_seat.dragActive()) {
+        if (!pressed) {
+            m_seat.notifyButton(timeMs, button, false); // no pointer focus during a drag: nothing sent
+            if (!m_seat.buttonsPressed())
+                m_seat.dragDrop();
+        }
+        return;
+    }
 
     // Menus open: a click outside their client closes them and goes nowhere
     // else; a click inside goes to the client without changing focus.

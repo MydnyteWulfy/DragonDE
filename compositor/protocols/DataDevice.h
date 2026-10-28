@@ -16,6 +16,8 @@ class Seat;
 // wl_data_offer for it and reads the data straight from the source through a
 // pipe. Drag and drop is refused for now.
 
+using DndAction = proto::WlDataDeviceManagerDndAction;
+
 class DataSource final : public proto::WlDataSource {
 public:
     using proto::WlDataSource::WlDataSource;
@@ -24,28 +26,46 @@ public:
         return static_cast<DataSource*>(proto::WlDataSource::fromResource(resource));
     }
     const std::vector<std::string>& mimeTypes() const { return m_mimeTypes; }
+    // What a drag from this source may do (v3+; older sources: copy).
+    DndAction dndActions() const { return version() >= 3 ? m_actions : DndAction::Copy; }
 
 protected:
     void handleOffer(std::string_view mimeType) override { m_mimeTypes.emplace_back(mimeType); }
-    void handleSetActions(proto::WlDataDeviceManagerDndAction) override {}
+    void handleSetActions(DndAction actions) override { m_actions = actions; }
 
 private:
     std::vector<std::string> m_mimeTypes;
+    DndAction m_actions = DndAction::None;
 };
 
+// An offer of a selection (clipboard) or of a drag in progress (`dnd`).
 class DataOffer final : public proto::WlDataOffer {
 public:
-    DataOffer(wl_client* client, std::uint32_t version, std::uint32_t id, DataSource* source);
+    DataOffer(wl_client* client, std::uint32_t version, std::uint32_t id, DataSource* source, bool dnd = false);
+
+    // Drag and drop: what the target agreed to.
+    const std::string& acceptedMimeType() const { return m_accepted; }
+    DndAction action() const { return m_action; }
+    // The drop happened: the target may now read the data and call finish.
+    void markDropped() { m_dropped = true; }
 
 protected:
     void handleReceive(std::string_view mimeType, std::int32_t fd) override;
-    void handleAccept(std::uint32_t, const char*) override {}
-    void handleFinish() override {}
-    void handleSetActions(proto::WlDataDeviceManagerDndAction, proto::WlDataDeviceManagerDndAction) override {}
+    void handleAccept(std::uint32_t serial, const char* mimeType) override;
+    void handleFinish() override;
+    void handleSetActions(DndAction actions, DndAction preferred) override;
 
 private:
+    void negotiate();
+
     DataSource* m_source;
     Connection m_sourceGone;
+    bool m_dnd;
+    bool m_dropped = false;
+    std::string m_accepted;
+    DndAction m_targetActions = DndAction::None;
+    DndAction m_preferred = DndAction::None;
+    DndAction m_action = DndAction::None;
 };
 
 class DataDevice final : public proto::WlDataDevice {

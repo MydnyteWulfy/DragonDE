@@ -17,6 +17,7 @@
 
 #include <csignal>
 #include <cstdlib>
+#include <cmath>
 #include <format>
 #include <map>
 #include <memory>
@@ -125,11 +126,19 @@ int main()
         dmabuf.formats.push_back({format, modifier});
     server.enableDmabuf(std::move(dmabuf));
 
+    // Client cursor images are drawn by us, above everything (set up once input exists).
+    OutputRenderer::OverlayProvider cursorOverlay;
+    OutputRenderer::OverlayProvider dragIconOverlay;
+
     // One output for now: new windows go in the middle of the first one.
     Connection areaFollowsMode;
     auto outputAdded = backend->outputAdded.connect([&](Output* output) {
         server.addOutput(*output);
-        renderers.emplace(output, std::make_unique<OutputRenderer>(server, *gpu, desktop, *textures, *output));
+        auto& renderer =
+            renderers.emplace(output, std::make_unique<OutputRenderer>(server, *gpu, desktop, *textures, *output))
+                .first->second;
+        renderer->addOverlay([&dragIconOverlay] { return dragIconOverlay ? dragIconOverlay() : std::nullopt; });
+        renderer->addOverlay([&cursorOverlay] { return cursorOverlay ? cursorOverlay() : std::nullopt; });
         if (renderers.size() == 1) {
             auto updateArea = [&desktop, output] {
                 desktop.setArea({0, 0, output->mode().width, output->mode().height});
@@ -162,6 +171,22 @@ int main()
                            process::spawn(cmd, {"XDG_ACTIVATION_TOKEN=" + token, "DESKTOP_STARTUP_ID=" + token});
                        }});
     auto reap = loop.addSignal(SIGCHLD, [] { process::reapChildren(); });
+    cursorOverlay = [&]() -> std::optional<Desktop::RenderItem> {
+        Surface* surface = server.seat().cursorSurface();
+        if (!surface || !input.pointerInside())
+            return std::nullopt;
+        const PointF p = input.pointerPosition();
+        const Point at{std::int32_t(std::lround(p.x)), std::int32_t(std::lround(p.y))};
+        return Desktop::RenderItem{surface, at - server.seat().cursorHotspot()};
+    };
+    dragIconOverlay = [&]() -> std::optional<Desktop::RenderItem> {
+        Surface* icon = server.seat().dragIcon();
+        if (!icon || !input.pointerInside())
+            return std::nullopt;
+        const PointF p = input.pointerPosition();
+        return Desktop::RenderItem{icon, Point{std::int32_t(std::lround(p.x)), std::int32_t(std::lround(p.y))} +
+                                             server.seat().dragIconOffset()};
+    };
 
     // `kill -USR1 <pid>`: save the next frame of every output as a PNG.
     int screenshots = 0;

@@ -6,8 +6,9 @@ A Wayland desktop environment written from scratch in C++23: own compositor
 
 **Status:** M0 and M1 complete; working toward everyday apps. Firefox and
 VS Code (Electron, `--ozone-platform=wayland`) run inside the nested session
-with GPU rendering, input, menus, copy/paste and middle-click paste, cursor
-shapes, focus activation and portal file dialogs. No XWayland yet, so
+with GPU rendering, input, menus, copy/paste and middle-click paste, drag and
+drop, cursors (named shapes and app-drawn images), focus activation and
+portal file dialogs. No XWayland yet, so
 X11-only apps don't run.
 
 ## Build

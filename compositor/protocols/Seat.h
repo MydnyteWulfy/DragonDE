@@ -19,6 +19,7 @@ struct xkb_state;
 
 namespace dragon {
 
+class DataOffer;
 class DataSource;
 class PrimarySource;
 class Server;
@@ -65,7 +66,13 @@ public:
     // client under the pointer, quoting the serial of its latest enter.
     // `shape` 0 = hidden; std::nullopt = its own cursor image (not drawn yet: default arrow).
     void requestCursor(wl_client* client, std::uint32_t serial, std::optional<std::uint32_t> shape);
+    // The client draws its own cursor: we composite `surface` at the pointer,
+    // minus `hotspot` (the backend's cursor is hidden meanwhile).
+    void requestCursorSurface(wl_client* client, std::uint32_t serial, Surface* surface, Point hotspot);
     Signal<std::uint32_t> cursorShapeChanged;
+    // Non-null while a client cursor image is showing.
+    Surface* cursorSurface() const { return m_cursorSurface; }
+    Point cursorHotspot() const { return m_cursorHotspot; }
 
     // Serial of the latest button press: move/resize/selection requests must quote it.
     std::uint32_t lastButtonSerial() const { return m_lastButtonSerial; }
@@ -76,6 +83,22 @@ public:
     // ----------------------------------------------------------- selection --
     void setSelection(DataSource* source);
     DataSource* selection() const { return m_selection; }
+    // -------------------------------------------------------- drag and drop --
+    // A client starts dragging `source` (null: a drag inside that client only)
+    // from `origin`, during the button press it quotes. Anything else cancels it.
+    void startDrag(wl_client* client, DataSource* source, Surface* origin, Surface* icon, std::uint32_t serial);
+    bool dragActive() const { return m_drag != nullptr; }
+    // The pointer is over `surface` (null: nothing that takes drops) during a drag.
+    void dragMotion(Surface* surface, PointF local, std::uint32_t timeMs);
+    // The button came up: drop if the target agreed, else cancel.
+    void dragDrop();
+    void cancelDrag();
+    // The icon to draw at the pointer, and its offset from the pointer.
+    Surface* dragIcon() const;
+    Point dragIconOffset() const;
+    Signal<> dragStarted;
+    Signal<> dragEnded;
+
     // Middle-click paste.
     void setPrimarySelection(PrimarySource* source);
     PrimarySource* primarySelection() const { return m_primary; }
@@ -127,7 +150,12 @@ private:
     PointF m_pointerLocal;
     std::uint32_t m_pointerEnterSerial = 0;
     std::uint32_t m_cursorShape = kDefaultCursor;
+    Surface* m_cursorSurface = nullptr;
+    Point m_cursorHotspot;
+    Connection m_cursorSurfaceGone;
+    Connection m_cursorSurfaceCommitted;
     void setCursorShape(std::uint32_t shape);
+    void clearCursorSurface();
     std::vector<std::uint32_t> m_pressedButtons;
     std::uint32_t m_lastButtonSerial = 0;
     struct InputSerial {
@@ -141,6 +169,11 @@ private:
     Connection m_selectionGone;
     PrimarySource* m_primary = nullptr;
     Connection m_primaryGone;
+
+    struct Drag;
+    std::unique_ptr<Drag> m_drag;
+    void dragLeave();
+    void endDrag();
 };
 
 } // namespace dragon

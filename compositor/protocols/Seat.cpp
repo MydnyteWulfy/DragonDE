@@ -30,15 +30,17 @@ public:
         : WlPointer(client, version, id), m_seat(seat) {}
 
 protected:
-    void handleSetCursor(std::uint32_t serial, wl_resource* surface, std::int32_t, std::int32_t) override
+    void handleSetCursor(std::uint32_t serial, wl_resource* surface, std::int32_t x, std::int32_t y) override
     {
         Surface* s = surface ? Surface::from(surface) : nullptr;
         if (s && (s->role() || !s->setRoleName(kCursorRole))) {
             postError(proto::WlPointerError::Role, "cursor surface already has another role");
             return;
         }
-        // Null surface: hide the cursor. A surface: the client's own image.
-        m_seat.requestCursor(client(), serial, s ? std::nullopt : std::optional<std::uint32_t>(Seat::kHiddenCursor));
+        if (s)
+            m_seat.requestCursorSurface(client(), serial, s, {x, y});
+        else
+            m_seat.requestCursor(client(), serial, Seat::kHiddenCursor);
     }
 
 private:
@@ -98,6 +100,19 @@ std::vector<T*> Seat::Tracked<T>::forClient(wl_client* client) const
     return out;
 }
 
+// -------------------------------------------------------------------- Drag --
+
+struct Seat::Drag {
+    wl_client* client;
+    DataSource* source; // null: drag within `client` only
+    Surface* icon;
+    Point iconOffset;
+    Surface* target = nullptr;
+    std::vector<DataOffer*> offers; // one per data device of the target's client
+    std::vector<Connection> connections;
+    Connection targetGone;
+};
+
 // -------------------------------------------------------------------- Seat --
 
 Seat::Seat(Server& server, std::string name) : m_server(server), m_name(std::move(name))
@@ -121,6 +136,7 @@ Seat::Seat(Server& server, std::string name) : m_server(server), m_name(std::mov
 
 Seat::~Seat()
 {
+    m_drag.reset();
     xkb_state_unref(m_xkbState);
     xkb_keymap_unref(m_keymap);
     xkb_context_unref(m_xkbContext);
@@ -327,8 +343,36 @@ void Seat::requestCursor(wl_client* client, std::uint32_t serial, std::optional<
     setCursorShape(shape.value_or(kDefaultCursor));
 }
 
+void Seat::requestCursorSurface(wl_client* client, std::uint32_t serial, Surface* surface, Point hotspot)
+{
+    if (!m_pointerFocus || m_pointerFocus->client() != client || serial != m_pointerEnterSerial)
+        return;
+    setCursorShape(kHiddenCursor); // the backend hides its cursor; we draw this one
+    m_cursorHotspot = hotspot;
+    if (surface == m_cursorSurface)
+        return;
+    m_cursorSurface = surface;
+    m_cursorSurfaceGone = surface->aboutToBeDestroyed.connect([this] {
+        m_cursorSurface = nullptr;
+        setCursorShape(kDefaultCursor);
+    });
+    // A new buffer can move the hotspot (attach offset / wl_surface.offset).
+    m_cursorSurfaceCommitted = surface->committed.connect([this] {
+        if (m_cursorSurface)
+            m_cursorHotspot = m_cursorHotspot - m_cursorSurface->takeOffset();
+    });
+}
+
+void Seat::clearCursorSurface()
+{
+    m_cursorSurface = nullptr;
+    m_cursorSurfaceGone.disconnect();
+    m_cursorSurfaceCommitted.disconnect();
+}
+
 void Seat::setCursorShape(std::uint32_t shape)
 {
+    clearCursorSurface(); // shapes and images are exclusive; image callers set theirs after this
     if (shape == m_cursorShape)
         return;
     m_cursorShape = shape;
@@ -472,6 +516,150 @@ void Seat::sendPrimarySelection(wl_client* client)
             offer->sendOffer(mime.c_str());
         device->sendSelection(offer->resource());
     }
+}
+
+// ----------------------------------------------------------- drag and drop --
+
+void Seat::startDrag(wl_client* client, DataSource* source, Surface* origin, Surface* icon, std::uint32_t serial)
+{
+    // Only from inside the press the client is reacting to, on its own surface.
+    const bool valid = !m_drag && buttonsPressed() && serial == m_lastButtonSerial && origin &&
+                       m_pointerFocus == origin && origin->client() == client;
+    if (!valid) {
+        log::debug("input", "refusing drag (no matching button press)");
+        if (source)
+            source->sendCancelled();
+        return;
+    }
+
+    m_drag = std::make_unique<Drag>(Drag{.client = client, .source = source, .icon = icon});
+    if (source)
+        m_drag->connections.push_back(source->destroyed.connect([this] {
+            m_drag->source = nullptr;
+            cancelDrag();
+        }));
+    if (icon) {
+        m_drag->connections.push_back(icon->aboutToBeDestroyed.connect([this] { m_drag->icon = nullptr; }));
+        m_drag->connections.push_back(icon->committed.connect([this] {
+            if (m_drag && m_drag->icon)
+                m_drag->iconOffset = m_drag->iconOffset + m_drag->icon->takeOffset();
+        }));
+    }
+
+    // The drag takes over the pointer: the origin sees it leave.
+    notifyPointerFocus(nullptr, {});
+    dragStarted.emit(); // the router reports the current position right away
+}
+
+Surface* Seat::dragIcon() const
+{
+    return m_drag ? m_drag->icon : nullptr;
+}
+
+Point Seat::dragIconOffset() const
+{
+    return m_drag ? m_drag->iconOffset : Point{};
+}
+
+void Seat::dragLeave()
+{
+    if (!m_drag || !m_drag->target)
+        return;
+    for (auto* device : m_dataDevices.forClient(m_drag->target->client()))
+        device->sendLeave();
+    m_drag->offers.clear(); // the offers are the client's to destroy
+    m_drag->target = nullptr;
+    m_drag->targetGone.disconnect();
+}
+
+void Seat::dragMotion(Surface* surface, PointF local, std::uint32_t timeMs)
+{
+    if (!m_drag)
+        return;
+    // A drag without a source stays inside its client.
+    if (surface && !m_drag->source && surface->client() != m_drag->client)
+        surface = nullptr;
+
+    if (surface == m_drag->target) {
+        if (surface) {
+            for (auto* device : m_dataDevices.forClient(surface->client()))
+                device->sendMotion(timeMs, local.x, local.y);
+        }
+        return;
+    }
+
+    dragLeave();
+    if (!surface)
+        return;
+    m_drag->target = surface;
+    m_drag->targetGone = surface->aboutToBeDestroyed.connect([this] {
+        m_drag->target = nullptr;
+        m_drag->offers.clear();
+    });
+
+    const std::uint32_t serial = nextSerial();
+    for (auto* device : m_dataDevices.forClient(surface->client())) {
+        DataOffer* offer = nullptr;
+        if (m_drag->source) {
+            offer = makeResource<DataOffer>(surface->client(), device->version(), 0u, m_drag->source, true);
+            if (!offer)
+                continue;
+            device->sendDataOffer(offer->resource());
+            for (const auto& mime : m_drag->source->mimeTypes())
+                offer->sendOffer(mime.c_str());
+            offer->sendSourceActions(m_drag->source->dndActions());
+            m_drag->offers.push_back(offer);
+            m_drag->connections.push_back(offer->destroyed.connect([this, offer] {
+                if (m_drag)
+                    std::erase(m_drag->offers, offer);
+            }));
+        }
+        device->sendEnter(serial, surface->resource(), local.x, local.y, offer ? offer->resource() : nullptr);
+    }
+}
+
+void Seat::dragDrop()
+{
+    if (!m_drag)
+        return;
+    Surface* target = m_drag->target;
+    DataOffer* offer = m_drag->offers.empty() ? nullptr : m_drag->offers.front();
+    const bool sourceless = !m_drag->source;
+    const bool agreed =
+        offer && !offer->acceptedMimeType().empty() &&
+        (offer->action() != DndAction::None || offer->version() < 3 || m_drag->source->version() < 3);
+
+    if (target && (agreed || sourceless)) {
+        for (auto* device : m_dataDevices.forClient(target->client()))
+            device->sendDrop();
+        if (offer)
+            offer->markDropped();
+        if (m_drag->source)
+            m_drag->source->sendDndDropPerformed();
+        // The offer stays until the target reads the data and calls finish.
+        m_drag->offers.clear();
+        m_drag->target = nullptr;
+        m_drag->targetGone.disconnect();
+        endDrag();
+        return;
+    }
+    cancelDrag();
+}
+
+void Seat::cancelDrag()
+{
+    if (!m_drag)
+        return;
+    dragLeave();
+    if (m_drag->source)
+        m_drag->source->sendCancelled();
+    endDrag();
+}
+
+void Seat::endDrag()
+{
+    m_drag.reset();
+    dragEnded.emit();
 }
 
 } // namespace dragon

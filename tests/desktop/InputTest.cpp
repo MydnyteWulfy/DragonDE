@@ -900,3 +900,209 @@ TEST_F(InputTest, LaunchTokenFocusesTheLaunchedApp)
     ASSERT_TRUE(roundtrip());
     EXPECT_EQ(in.keyboardSurface, a->surface);
 }
+
+TEST_F(InputTest, ClientCursorImageIsTrackedWithItsHotspot)
+{
+    auto w = window(100, 100);
+    std::vector<std::uint32_t> shapes;
+    auto c = server->seat().cursorShapeChanged.connect([&](std::uint32_t s) { shapes.push_back(s); });
+    move(400, 300);
+
+    auto* cursor = makeSurface();
+    wl_surface_attach(cursor, makeBuffer(16, 16), 0, 0);
+    wl_surface_commit(cursor);
+    wl_pointer_set_cursor(pointer, in.enterSerial, cursor, 3, 4);
+    ASSERT_TRUE(roundtrip());
+
+    Surface* serverCursor = server->seat().cursorSurface();
+    ASSERT_NE(serverCursor, nullptr);
+    EXPECT_EQ(serverCursor->resource(), surfaces.back()->resource());
+    EXPECT_EQ(server->seat().cursorHotspot(), (Point{3, 4}));
+    EXPECT_EQ(shapes, (std::vector<std::uint32_t>{0})) << "the backend's own cursor is hidden";
+
+    // New frame of an animated cursor, with the hotspot moved by an offset.
+    wl_surface_attach(cursor, makeBuffer(16, 16), 0, 0);
+    wl_surface_offset(cursor, 1, 2);
+    wl_surface_commit(cursor);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(server->seat().cursorHotspot(), (Point{2, 2}));
+
+    move(10, 10); // leaving the window: back to the default shape
+    EXPECT_EQ(server->seat().cursorSurface(), nullptr);
+    EXPECT_EQ(shapes.back(), 1u);
+}
+
+// ------------------------------------------------------------ drag and drop --
+
+namespace {
+// Everything both ends of a drag observed (the test client plays both).
+struct DragLog {
+    std::vector<std::string> source; // target / action / drop_performed / finished / cancelled
+    std::vector<std::string> device; // enter / leave / motion / drop
+    wl_data_offer* offer = nullptr;
+    std::vector<std::string> offeredTypes;
+    std::uint32_t sourceActions = 0;
+    std::uint32_t offerAction = 0;
+    std::uint32_t enterSerial = 0;
+    int sendFd = -1;
+};
+
+const wl_data_offer_listener kDragOfferListener = {
+    .offer = [](void* d, wl_data_offer*, const char* t) { static_cast<DragLog*>(d)->offeredTypes.emplace_back(t); },
+    .source_actions = [](void* d, wl_data_offer*, std::uint32_t a) { static_cast<DragLog*>(d)->sourceActions = a; },
+    .action = [](void* d, wl_data_offer*, std::uint32_t a) { static_cast<DragLog*>(d)->offerAction = a; },
+};
+const wl_data_device_listener kDragDeviceListener = {
+    .data_offer = [](void* d, wl_data_device*, wl_data_offer* o) { wl_data_offer_add_listener(o, &kDragOfferListener, d); },
+    .enter = [](void* d, wl_data_device*, std::uint32_t serial, wl_surface*, wl_fixed_t, wl_fixed_t, wl_data_offer* o) {
+        auto* l = static_cast<DragLog*>(d);
+        l->offer = o;
+        l->enterSerial = serial;
+        l->device.push_back("enter");
+    },
+    .leave = [](void* d, wl_data_device*) { static_cast<DragLog*>(d)->device.push_back("leave"); },
+    .motion = [](void* d, wl_data_device*, std::uint32_t, wl_fixed_t, wl_fixed_t) {
+        auto* l = static_cast<DragLog*>(d);
+        if (l->device.empty() || l->device.back() != "motion")
+            l->device.push_back("motion");
+    },
+    .drop = [](void* d, wl_data_device*) { static_cast<DragLog*>(d)->device.push_back("drop"); },
+    .selection = [](void*, wl_data_device*, wl_data_offer*) {},
+};
+const wl_data_source_listener kDragSourceListener = {
+    .target = [](void* d, wl_data_source*, const char* t) {
+        static_cast<DragLog*>(d)->source.push_back(std::string("target ") + (t ? t : "-"));
+    },
+    .send = [](void* d, wl_data_source*, const char*, std::int32_t fd) { static_cast<DragLog*>(d)->sendFd = fd; },
+    .cancelled = [](void* d, wl_data_source*) { static_cast<DragLog*>(d)->source.push_back("cancelled"); },
+    .dnd_drop_performed = [](void* d, wl_data_source*) { static_cast<DragLog*>(d)->source.push_back("drop_performed"); },
+    .dnd_finished = [](void* d, wl_data_source*) { static_cast<DragLog*>(d)->source.push_back("finished"); },
+    .action = [](void* d, wl_data_source*, std::uint32_t a) {
+        static_cast<DragLog*>(d)->source.push_back(std::format("action {}", a));
+    },
+};
+} // namespace
+
+class DragTest : public InputTest {
+protected:
+    wl_data_device* device = nullptr;
+    wl_data_source* source = nullptr;
+    DragLog log;
+
+    // Presses on the window and starts dragging "text/plain" (copy or move).
+    void startDrag(std::unique_ptr<test::ClientWindow>& w, std::optional<std::uint32_t> serial = std::nullopt,
+                   wl_surface* icon = nullptr)
+    {
+        device = track(wl_data_device_manager_get_data_device(ddm, seat));
+        wl_data_device_add_listener(device, &kDragDeviceListener, &log);
+        source = track(wl_data_device_manager_create_data_source(ddm));
+        wl_data_source_add_listener(source, &kDragSourceListener, &log);
+        wl_data_source_offer(source, "text/plain");
+        wl_data_source_set_actions(source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY | WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+        move(360, 260);
+        click(BTN_LEFT, true);
+        wl_data_device_start_drag(device, source, w->surface, icon, serial.value_or(in.lastButtonSerial));
+        ASSERT_TRUE(roundtrip());
+    }
+};
+
+TEST_F(DragTest, CopyDragAndDropRoundTrip)
+{
+    auto w = window(100, 100); // at (350, 250): both source and target here
+    startDrag(w);
+    ASSERT_TRUE(server->seat().dragActive());
+    EXPECT_EQ(log.device, (std::vector<std::string>{"enter"})) << "entered where the drag started";
+    EXPECT_EQ(log.offeredTypes, (std::vector<std::string>{"text/plain"}));
+    EXPECT_EQ(log.sourceActions, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY | WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+    EXPECT_TRUE(in.saw("leave")) << "the pointer leaves the origin while dragging";
+
+    // The target accepts text and prefers copy.
+    wl_data_offer_accept(log.offer, log.enterSerial, "text/plain");
+    wl_data_offer_set_actions(log.offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(log.offerAction, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+    EXPECT_EQ(log.source, (std::vector<std::string>{"target text/plain", "action 1"}));
+
+    move(380, 280);
+    click(BTN_LEFT, false); // drop
+    EXPECT_EQ(log.device, (std::vector<std::string>{"enter", "motion", "drop"}));
+    EXPECT_EQ(log.source.back(), "drop_performed");
+    EXPECT_FALSE(server->seat().dragActive());
+
+    // The target reads the data, then finishes.
+    int fds[2];
+    ASSERT_EQ(pipe2(fds, O_CLOEXEC), 0);
+    wl_data_offer_receive(log.offer, "text/plain", fds[1]);
+    close(fds[1]);
+    ASSERT_TRUE(roundtrip());
+    ASSERT_GE(log.sendFd, 0);
+    ASSERT_EQ(write(log.sendFd, "dragged", 7), 7);
+    close(log.sendFd);
+    char buf[16] = {};
+    EXPECT_EQ(read(fds[0], buf, sizeof(buf)), 7);
+    close(fds[0]);
+    EXPECT_STREQ(buf, "dragged");
+
+    wl_data_offer_finish(log.offer);
+    wl_data_offer_destroy(log.offer);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(log.source.back(), "finished");
+}
+
+TEST_F(DragTest, DroppingOnNothingCancels)
+{
+    auto w = window(100, 100);
+    startDrag(w);
+    wl_data_offer_accept(log.offer, log.enterSerial, "text/plain");
+    ASSERT_TRUE(roundtrip());
+
+    move(10, 10); // off the window: leave
+    click(BTN_LEFT, false);
+
+    EXPECT_EQ(log.device.back(), "leave");
+    EXPECT_EQ(log.source.back(), "cancelled");
+    EXPECT_FALSE(server->seat().dragActive());
+    EXPECT_EQ(in.pointerSurface, nullptr);
+    if (log.offer)
+        wl_data_offer_destroy(log.offer);
+}
+
+TEST_F(DragTest, EscapeCancels)
+{
+    auto w = window(100, 100);
+    startDrag(w);
+    key(KEY_ESC, true);
+    key(KEY_ESC, false);
+
+    EXPECT_EQ(log.source.back(), "cancelled");
+    EXPECT_FALSE(in.saw(std::format("key {} 1", KEY_ESC))) << "Esc was the compositor's";
+    click(BTN_LEFT, false);
+    if (log.offer)
+        wl_data_offer_destroy(log.offer);
+}
+
+TEST_F(DragTest, DragWithoutAPressIsRefused)
+{
+    auto w = window(100, 100);
+    startDrag(w, /*serial=*/7777);
+
+    EXPECT_FALSE(server->seat().dragActive());
+    EXPECT_EQ(log.source, (std::vector<std::string>{"cancelled"}));
+    click(BTN_LEFT, false);
+}
+
+TEST_F(DragTest, DragIconFollowsThePointer)
+{
+    auto w = window(100, 100);
+    auto* icon = makeSurface();
+    wl_surface_attach(icon, makeBuffer(8, 8), 0, 0);
+    wl_surface_commit(icon);
+    startDrag(w, std::nullopt, icon);
+
+    ASSERT_NE(server->seat().dragIcon(), nullptr);
+    EXPECT_EQ(server->seat().dragIcon()->resource(), surfaces.back()->resource());
+    click(BTN_LEFT, false);
+    EXPECT_EQ(server->seat().dragIcon(), nullptr);
+    if (log.offer)
+        wl_data_offer_destroy(log.offer);
+}
