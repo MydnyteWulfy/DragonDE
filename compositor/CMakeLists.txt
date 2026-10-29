@@ -34,6 +34,7 @@ dragon_add_protocol(dragon_wayland
     ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml)
 dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/staging/xdg-activation/xdg-activation-v1.xml)
 dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/staging/cursor-shape/cursor-shape-v1.xml)
+dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/staging/xwayland-shell/xwayland-shell-v1.xml)
 
 # GPU: render node, GBM allocation, dma-buf sync, swapchains, Vulkan renderer.
 find_package(Vulkan REQUIRED)
@@ -115,11 +116,25 @@ add_library(dragon_desktop STATIC
     desktop/InputRouter.cpp
     desktop/OutputRenderer.cpp
     desktop/SurfaceTextures.cpp
+    desktop/XdgWindow.cpp
 )
 target_link_libraries(dragon_desktop
     PUBLIC dragon_server dragon_render
     PRIVATE dragon::options
 )
 
+# X11 apps: Xwayland process management and the X window manager.
+pkg_check_modules(Xcb REQUIRED IMPORTED_TARGET xcb xcb-composite xcb-icccm)
+
+add_library(dragon_xwayland STATIC
+    xwayland/XwaylandServer.cpp
+    xwayland/XwaylandShell.cpp
+    xwayland/Xwm.cpp
+)
+target_link_libraries(dragon_xwayland
+    PUBLIC dragon_desktop
+    PRIVATE PkgConfig::Xcb dragon::options
+)
+
 add_executable(dragon-compositor main.cpp)
-target_link_libraries(dragon-compositor PRIVATE dragon_desktop dragon::options)
+target_link_libraries(dragon-compositor PRIVATE dragon_xwayland dragon::options)

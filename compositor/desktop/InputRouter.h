@@ -70,7 +70,7 @@ private:
     void updateGrab();
     void endGrab(std::uint32_t timeMs);
     // A client asked for move/resize: only honored for the button press it's reacting to.
-    bool clientGrabAllowed(std::uint32_t serial) const;
+    bool clientGrabAllowed(Desktop::Window& window, std::optional<std::uint32_t> serial) const;
 
     Desktop& m_desktop;
     Seat& m_seat;

@@ -325,7 +325,7 @@ DragonDE/
 | **M2** | Real apps | Tier 1 + 1g. dmabuf zero-copy; damage tracking; SSD; fractional scale; multiple nested outputs. Qt, GTK4, Firefox, mpv, and a LunarEngine build all run correctly. **Done so far:** Firefox + VS Code run; popup grabs and constraint adjustment, primary selection, cursor-shape (forwarded to the parent when nested), xdg-activation, configure_bounds and fitting oversized windows, private session bus + `dragonde-portals.conf` (GTK backend) for portals; drag and drop (actions, icons, Esc cancels); client cursor images composited by us. |
 | **M3** | Bare metal | DRM backend with libseat; launch from TTY; VT switching; hotplug; cursor plane; frame scheduling; VRR. SDDM session entry. |
 | **M4** | Desktop shell | Tier 2. Panel, launcher, notifications, wallpaper, lock screen, OSD. First "daily drive for an evening" test. |
-| **M5** | XWayland | XWM, clipboard/DnD bridging, Steam + Proton games work. |
+| **M5** | XWayland | XWM, clipboard/DnD bridging, Steam + Proton games work. **Done so far:** lazy Xwayland on our own display (lock + abstract/fs sockets, restarts after crashes); xcb XWM over `-wm` with xwayland-shell-v1 surface pairing (global only visible to Xwayland); X windows are desktop `Toplevel`s (focus via SetInputFocus/WM_TAKE_FOCUS, WM_DELETE_WINDOW, EWMH state/active/moveresize, size hints); override-redirect windows unmanaged. **Next:** CLIPBOARD/PRIMARY bridging (with INCR), DnD bridging. |
 | **M6** | Integration | Portals (screencast in OBS/Discord), polkit, settings app, config hot-reload, `dragonctl`. |
 | **M7** | Polish | Animations, blur/shadows, tiling, gestures, overview, direct scanout, HDR investigation. |
 

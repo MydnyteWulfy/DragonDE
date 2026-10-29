@@ -27,6 +27,18 @@ constexpr std::uint32_t kDataDeviceManagerVersion = 3;
 
 Server::Server(wl_display* display, EventLoop& loop) : m_display(display), m_loop(loop)
 {
+    wl_display_set_global_filter(
+        display,
+        [](const wl_client* client, const wl_global* global, void* data) {
+            auto* self = static_cast<Server*>(data);
+            for (const auto& [g, allowed] : self->m_globalFilters) {
+                if (g == global)
+                    return allowed(client);
+            }
+            return true;
+        },
+        this);
+
     m_compositor = Global::create<proto::WlCompositor>(
         display, kCompositorVersion, [this](wl_client* client, std::uint32_t version, std::uint32_t id) {
             makeResource<CompositorResource>(client, version, id, *this);
@@ -68,6 +80,12 @@ Server::~Server() = default;
 std::uint32_t Server::nextSerial()
 {
     return wl_display_next_serial(m_display);
+}
+
+void Server::restrictGlobal(const wl_global* global, std::function<bool(const wl_client*)> allowed)
+{
+    std::erase_if(m_globalFilters, [global](const auto& f) { return f.first == global; });
+    m_globalFilters.emplace_back(global, std::move(allowed));
 }
 
 void Server::enableDmabuf(DmabufSupport support)

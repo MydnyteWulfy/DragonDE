@@ -14,12 +14,15 @@ namespace dragon {
 
 class Server;
 class Surface;
+class Toplevel;
 class XdgPopup;
 class XdgSurface;
 class XdgToplevel;
+class XdgWindow;
 
-// The set of mapped windows and popups, where they are and their stacking
-// order. Window management policy (focus, move, tiling) grows from here.
+// The set of mapped windows, popups and unmanaged surfaces, where they are
+// and their stacking order, plus window management policy (focus, placement,
+// maximize, popup grabs). Windows are Toplevels: xdg_toplevel or X11.
 class Desktop {
 public:
     explicit Desktop(Server& server);
@@ -28,7 +31,7 @@ public:
     Desktop& operator=(const Desktop&) = delete;
 
     struct Window {
-        XdgToplevel* toplevel;
+        Toplevel* toplevel;
         Point position; // top-left of the window geometry, in global coordinates
 
         // Interactive resize: edges being dragged (XdgToplevelResizeEdge bits)
@@ -45,8 +48,18 @@ public:
     void setArea(Rect area);
     Rect area() const { return m_area; }
 
-    // Global window geometry (position + xdg window geometry size).
+    // Adds a window from outside the xdg-shell path (X11). The desktop tracks
+    // its map state from then on; the caller owns it.
+    void addToplevel(Toplevel& toplevel);
+
+    // Surfaces that place themselves and never take focus (X11 menus and
+    // tooltips): drawn above windows at `position`, hit-testable.
+    void setUnmanaged(Surface* surface, Point position);
+    void removeUnmanaged(Surface* surface);
+
+    // Global window geometry (position + window geometry size).
     Rect geometryOf(const Window& window) const;
+    void moveWindow(Window& window, Point position);
     void beginResize(Window& window, std::uint32_t edges);
     void endResize(Window& window);
     void setMaximized(Window& window, bool on);
@@ -54,15 +67,15 @@ public:
 
     // Mapped windows, bottom to top.
     const std::vector<std::unique_ptr<Window>>& windows() const { return m_windows; }
-    Window* windowFor(const XdgToplevel* toplevel) const;
+    Window* windowFor(const Toplevel* toplevel) const;
 
-    // A root surface (window or popup) and where its surface origin is. Each
-    // root's subsurfaces are drawn with it.
+    // A root surface (window, popup, unmanaged) and where its surface origin
+    // is. Each root's subsurfaces are drawn with it.
     struct RenderItem {
         Surface* surface;
         Point origin;
     };
-    // Bottom to top; each window is followed by its popups.
+    // Bottom to top: each window followed by its popups, then unmanaged surfaces.
     std::vector<RenderItem> renderList() const;
 
     // The topmost surface accepting input at `point` (global coordinates),
@@ -72,7 +85,7 @@ public:
         PointF local; // surface-local position
     };
     Hit surfaceAt(PointF point) const;
-    // Global position of any mapped surface's origin (windows, popups, subsurfaces).
+    // Global position of any mapped surface's origin (windows, popups, subsurfaces, unmanaged).
     std::optional<Point> originOf(Surface* surface) const;
     // The window a surface belongs to (through subsurfaces and popups), if any.
     Window* windowOf(Surface* surface) const;
@@ -88,18 +101,20 @@ public:
     void dismissPopups();
 
     Signal<Window*> windowMapped;
-    Signal<Window*> focusChanged;
-    // The client asked to be moved/resized by the pointer (e.g. dragging its title bar).
-    Signal<Window*, std::uint32_t> moveRequested;                // serial
-    Signal<Window*, std::uint32_t, std::uint32_t> resizeRequested; // serial, edges
     Signal<Window*> windowUnmapped;
+    Signal<Window*> focusChanged;
+    // The client asked to be moved/resized by the pointer (e.g. dragging its
+    // title bar). Serial: the input event it answers (none for X11).
+    Signal<Window*, std::optional<std::uint32_t>> moveRequested;
+    Signal<Window*, std::optional<std::uint32_t>, std::uint32_t> resizeRequested; // + edges
 
 private:
     struct Tracked;
-    void trackToplevel(XdgToplevel* toplevel);
+    void track(Toplevel& toplevel);
     void trackPopup(XdgPopup* popup);
-    void mapWindow(XdgToplevel* toplevel);
-    void unmapWindow(XdgToplevel* toplevel);
+    void mapWindow(Toplevel& toplevel);
+    void unmapWindow(Toplevel& toplevel);
+    Window* windowForSurface(const Surface* surface) const;
     std::optional<Point> surfaceOrigin(const XdgSurface* xdg) const;
     static XdgToplevel* rootToplevel(const XdgPopup* popup);
     static Surface* rootSurface(Surface* surface); // up through subsurface parents
@@ -116,9 +131,16 @@ private:
     Rect m_area{0, 0, 1280, 720};
     int m_cascade = 0;
     std::vector<std::unique_ptr<Window>> m_windows;
-    std::vector<XdgToplevel*> m_toplevels; // all of them, mapped or not
-    std::vector<XdgPopup*> m_popups;     // mapped, in mapping order
-    std::vector<XdgPopup*> m_popupGrabs; // grabbing popups, topmost last
+    std::vector<Toplevel*> m_toplevels;                  // all of them, mapped or not
+    std::vector<std::unique_ptr<XdgWindow>> m_xdgWindows; // the ones we own
+    std::vector<XdgPopup*> m_popups;                     // mapped, in mapping order
+    std::vector<XdgPopup*> m_popupGrabs;                 // grabbing popups, topmost last
+    struct Unmanaged {
+        Surface* surface;
+        Point position;
+        Connection gone;
+    };
+    std::vector<std::unique_ptr<Unmanaged>> m_unmanaged; // bottom to top
     std::unordered_map<const void*, std::unique_ptr<Tracked>> m_tracked;
     Connection m_toplevelCreated;
     Connection m_popupCreated;

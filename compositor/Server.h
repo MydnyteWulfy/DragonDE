@@ -11,7 +11,9 @@
 #include <optional>
 #include <vector>
 
+struct wl_client;
 struct wl_display;
+struct wl_global;
 
 namespace dragon {
 
@@ -48,6 +50,10 @@ public:
     void removeOutput(Output& output);
     OutputGlobal* outputGlobal(const Output& output) const;
 
+    // Hides `global` from clients for which `allowed` returns false (e.g.
+    // xwayland_shell_v1 is only for Xwayland).
+    void restrictGlobal(const wl_global* global, std::function<bool(const wl_client*)> allowed);
+
     Seat& seat() const { return *m_seat; }
     XdgActivation& activation() const { return *m_activation; }
 
@@ -75,6 +81,7 @@ private:
     std::unique_ptr<Global> m_primarySelectionManager;
     std::unique_ptr<CursorShapeManager> m_cursorShapeManager;
     std::unique_ptr<XdgActivation> m_activation;
+    std::vector<std::pair<const wl_global*, std::function<bool(const wl_client*)>>> m_globalFilters;
     std::vector<std::unique_ptr<OutputGlobal>> m_outputs;
     Connection m_flush;
 };

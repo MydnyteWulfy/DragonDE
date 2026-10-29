@@ -5,6 +5,7 @@
 
 #include "desktop/Desktop.h"
 #include "desktop/InputRouter.h"
+#include "desktop/Toplevel.h"
 #include "protocols/Seat.h"
 #include "protocols/XdgShell.h"
 
@@ -270,7 +271,7 @@ TEST_F(InputTest, ClickFocusesAndRaises)
     click(BTN_LEFT, false);
 
     EXPECT_EQ(in.keyboardSurface, a->surface);
-    EXPECT_EQ(desktop->windows().back()->toplevel, toplevels[0]) << "a is on top now";
+    EXPECT_EQ(desktop->windows().back()->toplevel->surface(), surfaces[0]) << "a is on top now";
     ASSERT_TRUE(roundtrip());
     EXPECT_TRUE(a->hasState(XDG_TOPLEVEL_STATE_ACTIVATED));
     EXPECT_FALSE(b->hasState(XDG_TOPLEVEL_STATE_ACTIVATED));

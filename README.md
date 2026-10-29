@@ -8,8 +8,9 @@ A Wayland desktop environment written from scratch in C++23: own compositor
 VS Code (Electron, `--ozone-platform=wayland`) run inside the nested session
 with GPU rendering, input, menus, copy/paste and middle-click paste, drag and
 drop, cursors (named shapes and app-drawn images), focus activation and
-portal file dialogs. No XWayland yet, so
-X11-only apps don't run.
+portal file dialogs. X11 apps run through Xwayland (started on demand) and
+are managed like any other window; copy/paste between X11 and Wayland apps
+isn't bridged yet.
 
 ## Build
 
@@ -45,7 +46,8 @@ WAYLAND_DISPLAY=wayland-1 ./build/debug/tools/demo-client/dragon-demo-client
 
 Apps started inside DragonDE (e.g. from a terminal opened with `Mod+Enter`)
 inherit its environment: Wayland socket, desktop name and private D-Bus
-session. Electron apps need `--ozone-platform=wayland` until XWayland exists.
+session, plus `DISPLAY` for X11 apps. Electron apps run natively on Wayland
+with `--ozone-platform=wayland`, or through Xwayland without it.
 
 Close the window or press Ctrl+C to quit.
 
@@ -73,6 +75,7 @@ resized and maximized from those.
 | `DRAGON_VK_VALIDATION` | `0`, `1` | on in Debug builds |
 | `DRAGON_MOD` | `super`, `alt`, `ctrl` | `super`; `alt` when nested |
 | `DRAGON_TERMINAL` | any shell command | `kitty` |
+| `DRAGON_XWAYLAND` | `0`, `1` | `1`: X11 apps get our own `DISPLAY`, served by Xwayland on first use |
 | `DRAGON_PRIVATE_BUS` | `0`, `1` | `1` when nested: apps get their own D-Bus session so portals (file dialogs) open inside DragonDE |
 | `DRAGON_SCREENSHOT_DIR` | directory | `/tmp`; `kill -USR1 <pid>` saves each output as PNG |
 
@@ -86,6 +89,7 @@ resized and maximized from those.
 | `compositor/render` | GBM allocation, dma-buf sync, swapchains, Vulkan renderer |
 | `compositor/backend` | Nested (window in a parent compositor) and headless backends |
 | `compositor/desktop` | Window placement and focus, input routing, surface textures, per-output rendering |
+| `compositor/xwayland` | Xwayland process (lazy start, display/lock/sockets), X11 window manager, xwayland-shell |
 | `tools/scanner` | `dragon-scanner`: protocol XML → C++ |
 | `tools/demo-client` | Minimal animated wl_shm client for manual testing |
 | `tests` | GoogleTest suite (GPU tests skip without a GPU) |

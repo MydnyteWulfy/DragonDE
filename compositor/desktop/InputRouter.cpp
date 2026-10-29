@@ -2,6 +2,7 @@
 
 #include "backend/Backend.h"
 #include "core/Log.h"
+#include "desktop/Toplevel.h"
 #include "protocols/Compositor.h"
 #include "protocols/Seat.h"
 #include "protocols/XdgShell.h"
@@ -63,13 +64,14 @@ InputRouter::InputRouter(Backend& backend, Desktop& desktop, Seat& seat, WindowM
     }));
     m_connections.push_back(seat.dragEnded.connect([this] { updatePointerFocus(0, false); }));
 
-    m_connections.push_back(desktop.moveRequested.connect([this](Desktop::Window* w, std::uint32_t serial) {
-        if (clientGrabAllowed(serial))
-            startGrab(GrabKind::Move, *w, m_lastClientButton, 0);
-    }));
     m_connections.push_back(
-        desktop.resizeRequested.connect([this](Desktop::Window* w, std::uint32_t serial, std::uint32_t edges) {
-            if (clientGrabAllowed(serial) && edges != 0)
+        desktop.moveRequested.connect([this](Desktop::Window* w, std::optional<std::uint32_t> serial) {
+            if (clientGrabAllowed(*w, serial))
+                startGrab(GrabKind::Move, *w, m_lastClientButton, 0);
+        }));
+    m_connections.push_back(desktop.resizeRequested.connect(
+        [this](Desktop::Window* w, std::optional<std::uint32_t> serial, std::uint32_t edges) {
+            if (clientGrabAllowed(*w, serial) && edges != 0)
                 startGrab(GrabKind::Resize, *w, m_lastClientButton, edges);
         }));
 
@@ -109,7 +111,7 @@ bool InputRouter::runShortcut(std::uint32_t key)
         return true;
     case KEY_Q:
         if (auto* w = m_desktop.focusedWindow())
-            w->toplevel->requestClose();
+            w->toplevel->close();
         return true;
     case KEY_ESC:
         if (!shift)
@@ -234,11 +236,15 @@ void InputRouter::button(std::uint32_t button, bool pressed, std::uint32_t timeM
 
 // ------------------------------------------------------------------ grabs --
 
-bool InputRouter::clientGrabAllowed(std::uint32_t serial) const
+bool InputRouter::clientGrabAllowed(Desktop::Window& window, std::optional<std::uint32_t> serial) const
 {
-    // Stale or forged serials (no button held, or an older press) are ignored,
-    // so clients can't start drags on their own.
-    return !grabbing() && m_seat.buttonsPressed() && serial == m_seat.lastButtonSerial();
+    // Only while a button is held, so clients can't start drags on their own.
+    if (grabbing() || !m_seat.buttonsPressed())
+        return false;
+    // Wayland quotes the press; X11 can't, so the press must be on that window.
+    if (serial)
+        return *serial == m_seat.lastButtonSerial();
+    return m_seat.pointerFocus() && m_desktop.windowOf(m_seat.pointerFocus()) == &window;
 }
 
 void InputRouter::startGrab(GrabKind kind, Desktop::Window& window, std::uint32_t button, std::uint32_t edges)
@@ -248,7 +254,7 @@ void InputRouter::startGrab(GrabKind kind, Desktop::Window& window, std::uint32_
         const auto restored = window.restore->size();
         m_desktop.setMaximized(window, false);
         m_desktop.setFullscreen(window, false);
-        window.position = {std::int32_t(m_pointer.x) - restored.width / 2, std::int32_t(m_pointer.y) - 10};
+        m_desktop.moveWindow(window, {std::int32_t(m_pointer.x) - restored.width / 2, std::int32_t(m_pointer.y) - 10});
     }
 
     m_seat.notifyPointerFocus(nullptr, {}); // clients see a leave; input is ours until release
@@ -265,7 +271,7 @@ void InputRouter::updateGrab()
     const auto dx = std::int32_t(std::lround(d.x)), dy = std::int32_t(std::lround(d.y));
 
     if (m_grab.kind == GrabKind::Move) {
-        w.position = m_grab.startPosition + Point{dx, dy};
+        m_desktop.moveWindow(w, m_grab.startPosition + Point{dx, dy});
         return;
     }
 

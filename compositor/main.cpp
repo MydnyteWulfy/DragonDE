@@ -13,6 +13,9 @@
 #include "protocols/XdgActivation.h"
 #include "protocols/LinuxDmabuf.h"
 #include "render/Gpu.h"
+#include "xwayland/XwaylandServer.h"
+#include "xwayland/XwaylandShell.h"
+#include "xwayland/Xwm.h"
 #include "render/vulkan/VulkanTexture.h"
 
 #include <csignal>
@@ -207,13 +210,35 @@ int main()
     }
     log::info("core", "running: {} backend, {} output(s), WAYLAND_DISPLAY={}", backend->name(),
               backend->outputs().size(), socket);
+    // X11 apps get our own X display, served by Xwayland once one connects.
+    std::unique_ptr<XwaylandShell> xwaylandShell;
+    std::unique_ptr<XwaylandServer> xwayland;
+    std::unique_ptr<Xwm> xwm;
+    Connection xwaylandStarted, xwaylandReady, xwaylandStopped;
+    if (env("DRAGON_XWAYLAND") != "0") {
+        xwaylandShell = std::make_unique<XwaylandShell>(server);
+        xwayland = std::make_unique<XwaylandServer>(server, loop);
+        xwaylandStarted = xwayland->started.connect([&](wl_client* c) { xwaylandShell->setXwaylandClient(c); });
+        xwaylandReady = xwayland->ready.connect([&](int wmFd) {
+            xwm = std::make_unique<Xwm>(server, loop, desktop, *xwaylandShell, wmFd);
+        });
+        xwaylandStopped = xwayland->stopped.connect([&] {
+            xwm.reset();
+            xwaylandShell->setXwaylandClient(nullptr);
+        });
+        if (!xwayland->listen())
+            xwayland.reset();
+    }
+
     // Everything we launch connects to us. (The nested backend is already
     // connected to its parent, so changing our own environment is safe now.)
     setenv("WAYLAND_DISPLAY", socket, 1);
     unsetenv("WAYLAND_SOCKET");
-    // No XWayland yet: without this, X11-capable apps would open on the
-    // parent session's X server instead of failing or using Wayland.
-    unsetenv("DISPLAY");
+    // Our X display, or none: X11 apps must never reach the parent session's X server.
+    if (xwayland)
+        setenv("DISPLAY", xwayland->displayName().c_str(), 1);
+    else
+        unsetenv("DISPLAY");
     // Apps pick portal backends, themes and quirks by desktop name.
     setenv("XDG_CURRENT_DESKTOP", "DragonDE", 1);
     setenv("XDG_SESSION_DESKTOP", "DragonDE", 1);

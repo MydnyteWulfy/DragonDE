@@ -2,6 +2,8 @@
 
 #include "Server.h"
 #include "core/Log.h"
+#include "desktop/Toplevel.h"
+#include "desktop/XdgWindow.h"
 #include "protocols/Compositor.h"
 #include "protocols/Seat.h"
 #include "protocols/XdgActivation.h"
@@ -19,7 +21,10 @@ struct Desktop::Tracked {
 
 Desktop::Desktop(Server& server) : m_server(server)
 {
-    m_toplevelCreated = server.toplevelCreated.connect([this](XdgToplevel* t) { trackToplevel(t); });
+    m_toplevelCreated = server.toplevelCreated.connect([this](XdgToplevel* t) {
+        m_xdgWindows.push_back(std::make_unique<XdgWindow>(*t));
+        track(*m_xdgWindows.back());
+    });
     m_popupCreated = server.popupCreated.connect([this](XdgPopup* p) { trackPopup(p); });
 
     m_activation = server.activation().activationRequested.connect([this](Surface* surface) {
@@ -42,45 +47,60 @@ Desktop::Desktop(Server& server) : m_server(server)
 Desktop::~Desktop()
 {
     m_server.popupBoundsProvider = nullptr;
+    m_tracked.clear(); // stop listening before our containers go
 }
 
-Desktop::Window* Desktop::windowFor(const XdgToplevel* toplevel) const
+Desktop::Window* Desktop::windowFor(const Toplevel* toplevel) const
 {
     auto it = std::ranges::find_if(m_windows, [toplevel](const auto& w) { return w->toplevel == toplevel; });
     return it == m_windows.end() ? nullptr : it->get();
 }
 
-void Desktop::trackToplevel(XdgToplevel* toplevel)
+Desktop::Window* Desktop::windowForSurface(const Surface* surface) const
 {
-    toplevel->setBounds(m_area.size()); // so the first configure already tells the client what fits
-    m_toplevels.push_back(toplevel);
+    if (!surface)
+        return nullptr;
+    auto it = std::ranges::find_if(m_windows, [surface](const auto& w) { return w->toplevel->surface() == surface; });
+    return it == m_windows.end() ? nullptr : it->get();
+}
+
+void Desktop::addToplevel(Toplevel& toplevel)
+{
+    track(toplevel);
+}
+
+void Desktop::track(Toplevel& toplevel)
+{
+    Toplevel* t = &toplevel;
+    t->setBounds(m_area.size()); // so the first configure already tells the client what fits
+    m_toplevels.push_back(t);
     auto tracked = std::make_unique<Tracked>();
-    XdgSurface* xdg = toplevel->xdgSurface();
-    tracked->connections.push_back(xdg->mapped.connect([this, toplevel] { mapWindow(toplevel); }));
-    tracked->connections.push_back(xdg->unmapped.connect([this, toplevel] { unmapWindow(toplevel); }));
+    tracked->connections.push_back(t->mapped.connect([this, t] { mapWindow(*t); }));
+    tracked->connections.push_back(t->unmapped.connect([this, t] { unmapWindow(*t); }));
     // Before mapping there's no Window yet: answer in the first configure.
-    tracked->connections.push_back(toplevel->maximizeRequested.connect([this, toplevel](bool on) {
-        if (Window* w = windowFor(toplevel))
+    tracked->connections.push_back(t->maximizeRequested.connect([this, t](bool on) {
+        if (Window* w = windowFor(t))
             setMaximized(*w, on);
         else {
-            toplevel->setMaximized(on);
-            toplevel->setSize(on ? m_area.size() : Size{});
+            t->setMaximized(on);
+            t->setSize(on ? m_area.size() : Size{});
         }
     }));
-    tracked->connections.push_back(toplevel->fullscreenRequested.connect([this, toplevel](bool on) {
-        if (Window* w = windowFor(toplevel))
+    tracked->connections.push_back(t->fullscreenRequested.connect([this, t](bool on) {
+        if (Window* w = windowFor(t))
             setFullscreen(*w, on);
         else {
-            toplevel->setFullscreen(on);
-            toplevel->setSize(on ? m_area.size() : Size{});
+            t->setFullscreen(on);
+            t->setSize(on ? m_area.size() : Size{});
         }
     }));
-    tracked->connections.push_back(toplevel->destroyed.connect([this, toplevel] {
-        unmapWindow(toplevel); // no-op if already unmapped
-        std::erase(m_toplevels, toplevel);
-        m_tracked.erase(toplevel);
+    tracked->connections.push_back(t->destroyed.connect([this, t] {
+        unmapWindow(*t); // no-op if already unmapped
+        std::erase(m_toplevels, t);
+        m_tracked.erase(t); // destroys this connection's owner: nothing below may touch `tracked`
+        std::erase_if(m_xdgWindows, [t](const auto& w) { return w.get() == t; });
     }));
-    m_tracked.emplace(toplevel, std::move(tracked));
+    m_tracked.emplace(t, std::move(tracked));
 }
 
 void Desktop::trackPopup(XdgPopup* popup)
@@ -96,19 +116,21 @@ void Desktop::trackPopup(XdgPopup* popup)
     m_tracked.emplace(popup, std::move(tracked));
 }
 
-void Desktop::mapWindow(XdgToplevel* toplevel)
+void Desktop::mapWindow(Toplevel& toplevel)
 {
-    Rect geometry = toplevel->xdgSurface()->geometry();
+    if (windowFor(&toplevel))
+        return;
+    Rect geometry = toplevel.geometry();
 
     // Bigger than the screen (clients that ignore configure_bounds, like GTK3
     // dialogs): ask it to fit, within what its minimum size allows. It's
     // placed as if it already had the new size.
-    const Size min = toplevel->minSize();
+    const Size min = toplevel.minSize();
     if (geometry.width > m_area.width || geometry.height > m_area.height) {
         const Size fit{std::max(std::min(geometry.width, m_area.width), min.width),
                        std::max(std::min(geometry.height, m_area.height), min.height)};
         if (fit != geometry.size()) {
-            toplevel->setSize(fit);
+            toplevel.setSize(fit);
             geometry.width = fit.width;
             geometry.height = fit.height;
         }
@@ -121,39 +143,55 @@ void Desktop::mapWindow(XdgToplevel* toplevel)
               m_area.y + (m_area.height - geometry.height) / 2 + offset};
     pos.x = std::max(pos.x, m_area.x);
     pos.y = std::max(pos.y, m_area.y);
-    const auto& configured = toplevel->pendingConfigure();
-    if (configured.maximized || configured.fullscreen)
+    if (toplevel.maximized() || toplevel.fullscreen())
         pos = m_area.position(); // started maximized: fill the area
 
-    m_windows.push_back(std::make_unique<Window>(Window{.toplevel = toplevel, .position = pos}));
+    m_windows.push_back(std::make_unique<Window>(Window{.toplevel = &toplevel, .position = pos}));
     Window* window = m_windows.back().get();
-    window->connections.push_back(
-        toplevel->moveRequested.connect([this, window](std::uint32_t serial) { moveRequested.emit(window, serial); }));
-    window->connections.push_back(toplevel->resizeRequested.connect(
-        [this, window](std::uint32_t serial, proto::XdgToplevelResizeEdge edges) {
-            resizeRequested.emit(window, serial, std::uint32_t(edges));
+    toplevel.setPosition(pos);
+    window->connections.push_back(toplevel.moveRequested.connect(
+        [this, window](std::optional<std::uint32_t> serial) { moveRequested.emit(window, serial); }));
+    window->connections.push_back(toplevel.resizeRequested.connect(
+        [this, window](std::optional<std::uint32_t> serial, std::uint32_t edges) {
+            resizeRequested.emit(window, serial, edges);
         }));
-    if (Surface* surface = toplevel->xdgSurface()->surface())
-        window->connections.push_back(surface->committed.connect([this, window] { committed(*window); }));
-    log::debug("desktop", "mapped '{}' ({}) {}x{} at {},{}", toplevel->title(), toplevel->appId(), geometry.width,
+    window->connections.push_back(toplevel.committed.connect([this, window] { committed(*window); }));
+    log::debug("desktop", "mapped '{}' ({}) {}x{} at {},{}", toplevel.title(), toplevel.appId(), geometry.width,
                geometry.height, pos.x, pos.y);
     windowMapped.emit(window);
     focus(window); // new windows get focus
 }
 
-void Desktop::unmapWindow(XdgToplevel* toplevel)
+void Desktop::unmapWindow(Toplevel& toplevel)
 {
-    auto it = std::ranges::find_if(m_windows, [toplevel](const auto& w) { return w->toplevel == toplevel; });
+    auto it = std::ranges::find_if(m_windows, [&toplevel](const auto& w) { return w->toplevel == &toplevel; });
     if (it == m_windows.end())
         return;
     auto window = std::move(*it);
     m_windows.erase(it);
-    log::debug("desktop", "unmapped '{}'", toplevel->title());
+    log::debug("desktop", "unmapped '{}'", toplevel.title());
     windowUnmapped.emit(window.get());
     if (m_focused == window.get()) {
         m_focused = nullptr;
         focus(m_windows.empty() ? nullptr : m_windows.back().get()); // next one down
     }
+}
+
+void Desktop::setUnmanaged(Surface* surface, Point position)
+{
+    auto it = std::ranges::find_if(m_unmanaged, [surface](const auto& u) { return u->surface == surface; });
+    if (it != m_unmanaged.end()) {
+        (*it)->position = position;
+        return;
+    }
+    auto u = std::make_unique<Unmanaged>(Unmanaged{surface, position, {}});
+    u->gone = surface->aboutToBeDestroyed.connect([this, surface] { removeUnmanaged(surface); });
+    m_unmanaged.push_back(std::move(u));
+}
+
+void Desktop::removeUnmanaged(Surface* surface)
+{
+    std::erase_if(m_unmanaged, [surface](const auto& u) { return u->surface == surface; });
 }
 
 XdgToplevel* Desktop::rootToplevel(const XdgPopup* popup)
@@ -171,8 +209,8 @@ XdgToplevel* Desktop::rootToplevel(const XdgPopup* popup)
 std::optional<Point> Desktop::surfaceOrigin(const XdgSurface* xdg) const
 {
     const Point geometryOffset = xdg->geometry().position();
-    if (const XdgToplevel* toplevel = xdg->toplevel()) {
-        const Window* w = windowFor(toplevel);
+    if (xdg->toplevel()) {
+        const Window* w = windowForSurface(xdg->surface());
         if (!w)
             return std::nullopt;
         return w->position - geometryOffset;
@@ -194,18 +232,23 @@ std::vector<Desktop::RenderItem> Desktop::renderList() const
 {
     std::vector<RenderItem> items;
     for (const auto& w : m_windows) {
-        XdgSurface* xdg = w->toplevel->xdgSurface();
-        if (!xdg || !xdg->surface())
+        Surface* surface = w->toplevel->surface();
+        if (!surface)
             continue;
-        if (auto origin = surfaceOrigin(xdg))
-            items.push_back({xdg->surface(), *origin});
+        items.push_back({surface, w->position - w->toplevel->geometry().position()});
 
         for (XdgPopup* popup : m_popups) {
-            if (rootToplevel(popup) != w->toplevel || !popup->xdgSurface() || !popup->xdgSurface()->surface())
+            const XdgToplevel* root = rootToplevel(popup);
+            if (!root || !root->xdgSurface() || root->xdgSurface()->surface() != surface || !popup->xdgSurface() ||
+                !popup->xdgSurface()->surface())
                 continue;
             if (auto origin = surfaceOrigin(popup->xdgSurface()))
                 items.push_back({popup->xdgSurface()->surface(), *origin});
         }
+    }
+    for (const auto& u : m_unmanaged) {
+        if (u->surface->hasContent())
+            items.push_back({u->surface, u->position});
     }
     return items;
 }
@@ -215,19 +258,24 @@ void Desktop::setArea(Rect area)
     if (area == m_area)
         return;
     m_area = area;
-    for (XdgToplevel* t : m_toplevels)
+    for (Toplevel* t : m_toplevels)
         t->setBounds(area.size());
     for (const auto& w : m_windows) {
         if (w->restore) // maximized/fullscreen windows follow the area
-            setFillState(*w, true, w->toplevel->pendingConfigure().fullscreen);
+            setFillState(*w, true, w->toplevel->fullscreen());
     }
 }
 
 Rect Desktop::geometryOf(const Window& window) const
 {
-    const XdgSurface* xdg = window.toplevel->xdgSurface();
-    const Size size = xdg ? xdg->geometry().size() : Size{};
+    const Size size = window.toplevel->geometry().size();
     return {window.position.x, window.position.y, size.width, size.height};
+}
+
+void Desktop::moveWindow(Window& window, Point position)
+{
+    window.position = position;
+    window.toplevel->setPosition(position);
 }
 
 void Desktop::beginResize(Window& window, std::uint32_t edges)
@@ -251,10 +299,13 @@ void Desktop::committed(Window& window)
     // bottom, so move the window to keep the opposite edge where it was.
     const Rect g = geometryOf(window);
     const auto edges = window.resizeEdges;
+    Point p = window.position;
     if (edges & std::uint32_t(proto::XdgToplevelResizeEdge::Left))
-        window.position.x = window.resizeStart.x + window.resizeStart.width - g.width;
+        p.x = window.resizeStart.x + window.resizeStart.width - g.width;
     if (edges & std::uint32_t(proto::XdgToplevelResizeEdge::Top))
-        window.position.y = window.resizeStart.y + window.resizeStart.height - g.height;
+        p.y = window.resizeStart.y + window.resizeStart.height - g.height;
+    if (p != window.position)
+        moveWindow(window, p);
 }
 
 void Desktop::setMaximized(Window& window, bool on)
@@ -269,23 +320,21 @@ void Desktop::setFullscreen(Window& window, bool on)
 
 void Desktop::setFillState(Window& window, bool on, bool fullscreen)
 {
-    XdgToplevel* tl = window.toplevel;
+    Toplevel* tl = window.toplevel;
     if (fullscreen)
         tl->setFullscreen(on);
     else
         tl->setMaximized(on);
 
-    const auto& cfg = tl->pendingConfigure();
-    const bool filling = cfg.maximized || cfg.fullscreen;
-    if (filling) {
+    if (tl->maximized() || tl->fullscreen()) {
         if (!window.restore)
             window.restore = geometryOf(window);
         // No panels yet: maximized and fullscreen both fill the whole area.
         tl->setSize(m_area.size());
-        window.position = m_area.position();
+        moveWindow(window, m_area.position());
     } else if (window.restore) {
         tl->setSize(window.restore->size());
-        window.position = window.restore->position();
+        moveWindow(window, window.restore->position());
         window.restore.reset();
     }
 }
@@ -301,8 +350,10 @@ void Desktop::popupMapped(XdgPopup* popup)
     XdgSurface* xdg = popup->xdgSurface();
     Surface* surface = xdg ? xdg->surface() : nullptr;
     const bool fromInput = surface && m_server.seat().isRecentInputSerial(surface->client(), popup->grabSerial());
+    const XdgToplevel* root = rootToplevel(popup);
     const bool nests = m_popupGrabs.empty()
-                           ? m_focused && rootToplevel(popup) == m_focused->toplevel
+                           ? m_focused && root && root->xdgSurface() &&
+                                 root->xdgSurface()->surface() == m_focused->toplevel->surface()
                            : popup->parent() == m_popupGrabs.back()->xdgSurface();
     if (!fromInput || !nests) {
         log::debug("desktop", "refusing popup grab (input: {}, nesting: {})", fromInput, nests);
@@ -344,8 +395,7 @@ void Desktop::restoreKeyboardFocus()
         if (auto* xdg = m_popupGrabs.back()->xdgSurface())
             surface = xdg->surface();
     } else if (m_focused) {
-        if (auto* xdg = m_focused->toplevel->xdgSurface())
-            surface = xdg->surface();
+        surface = m_focused->toplevel->surface();
     }
     m_server.seat().setKeyboardFocus(surface);
 }
@@ -361,6 +411,7 @@ void Desktop::focus(Window* window)
         if (it == m_windows.end())
             return;
         std::rotate(it, it + 1, m_windows.end());
+        window->toplevel->raised();
     }
     if (window == m_focused)
         return;
@@ -371,8 +422,7 @@ void Desktop::focus(Window* window)
     Surface* surface = nullptr;
     if (window) {
         window->toplevel->setActivated(true);
-        if (auto* xdg = window->toplevel->xdgSurface())
-            surface = xdg->surface();
+        surface = window->toplevel->surface();
     }
     m_server.seat().setKeyboardFocus(surface);
     focusChanged.emit(window);
@@ -401,25 +451,29 @@ std::optional<Point> Desktop::originOf(Surface* surface) const
     }
     if (!s)
         return std::nullopt;
-    const auto* xdg = dynamic_cast<const XdgSurface*>(s->role());
-    if (!xdg)
-        return std::nullopt;
-    auto origin = surfaceOrigin(xdg);
-    if (!origin)
-        return std::nullopt;
-    return *origin + offset;
+    if (const Window* w = windowForSurface(s))
+        return w->position - w->toplevel->geometry().position() + offset;
+    for (const auto& u : m_unmanaged) {
+        if (u->surface == s)
+            return u->position + offset;
+    }
+    if (const auto* xdg = dynamic_cast<const XdgSurface*>(s->role())) {
+        if (auto origin = surfaceOrigin(xdg))
+            return *origin + offset;
+    }
+    return std::nullopt;
 }
 
 Desktop::Window* Desktop::windowOf(Surface* surface) const
 {
     Surface* root = rootSurface(surface);
+    if (Window* w = windowForSurface(root))
+        return w;
     const auto* xdg = root ? dynamic_cast<const XdgSurface*>(root->role()) : nullptr;
-    if (!xdg)
-        return nullptr;
-    if (xdg->toplevel())
-        return windowFor(xdg->toplevel());
-    if (xdg->popup())
-        return windowFor(rootToplevel(xdg->popup()));
+    if (xdg && xdg->popup()) {
+        const XdgToplevel* top = rootToplevel(xdg->popup());
+        return top && top->xdgSurface() ? windowForSurface(top->xdgSurface()->surface()) : nullptr;
+    }
     return nullptr;
 }
 
