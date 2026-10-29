@@ -6,10 +6,12 @@
 #include "protocols/Compositor.h"
 #include "protocols/CursorShape.h"
 #include "protocols/DataDevice.h"
+#include "protocols/LayerShell.h"
 #include "protocols/LinuxDmabuf.h"
 #include "protocols/Output.h"
 #include "protocols/Seat.h"
 #include "protocols/XdgActivation.h"
+#include "protocols/XdgDecoration.h"
 #include "protocols/XdgShell.h"
 
 #include <algorithm>
@@ -52,6 +54,9 @@ Server::Server(wl_display* display, EventLoop& loop) : m_display(display), m_loo
             makeResource<XdgWmBase>(client, version, id, *this);
         });
 
+    m_xdgDecorationManager = createXdgDecorationGlobal(display);
+    m_xdgOutputManager = createXdgOutputManager(*this);
+
     m_seat = std::make_unique<Seat>(*this);
     m_dataDeviceManager = Global::create<proto::WlDataDeviceManager>(
         display, kDataDeviceManagerVersion, [this](wl_client* client, std::uint32_t version, std::uint32_t id) {
@@ -59,6 +64,7 @@ Server::Server(wl_display* display, EventLoop& loop) : m_display(display), m_loo
         });
     m_cursorShapeManager = std::make_unique<CursorShapeManager>(*this, *m_seat);
     m_activation = std::make_unique<XdgActivation>(*this);
+    m_layerShell = std::make_unique<LayerShell>(*this);
     m_primarySelectionManager = Global::create<proto::ZwpPrimarySelectionDeviceManagerV1>(
         display, 1, [this](wl_client* client, std::uint32_t version, std::uint32_t id) {
             makeResource<PrimaryDeviceManager>(client, version, id, *m_seat);
@@ -101,6 +107,12 @@ void Server::addOutput(Output& output)
 void Server::removeOutput(Output& output)
 {
     std::erase_if(m_outputs, [&output](const auto& g) { return &g->output() == &output; });
+}
+
+OutputGlobal* Server::outputGlobalFor(wl_resource* wlOutput) const
+{
+    auto it = std::ranges::find_if(m_outputs, [wlOutput](const auto& g) { return g->owns(wlOutput); });
+    return it == m_outputs.end() ? nullptr : it->get();
 }
 
 OutputGlobal* Server::outputGlobal(const Output& output) const

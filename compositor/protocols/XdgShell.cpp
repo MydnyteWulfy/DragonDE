@@ -1,5 +1,7 @@
 #include "protocols/XdgShell.h"
 
+#include "protocols/XdgDecoration.h"
+
 #include "Server.h"
 #include "core/EventLoop.h"
 #include "core/Log.h"
@@ -467,13 +469,46 @@ void XdgToplevel::setMaximized(bool on) { update(&Configure::maximized, on); }
 void XdgToplevel::setFullscreen(bool on) { update(&Configure::fullscreen, on); }
 void XdgToplevel::setResizing(bool on) { update(&Configure::resizing, on); }
 
+void XdgToplevel::attachDecoration(XdgToplevelDecoration* decoration)
+{
+    m_decoration = decoration;
+    m_decorationDirty = decoration != nullptr; // a new object always gets told the mode
+    if (decoration && m_xdg)
+        m_xdg->scheduleConfigure();
+    decorationChanged.emit();
+}
+
+void XdgToplevel::decorationRequested()
+{
+    m_decorationDirty = true; // set_mode/unset_mode must be answered with a configure
+    if (m_xdg)
+        m_xdg->scheduleConfigure();
+    decorationChanged.emit();
+}
+
+void XdgToplevel::setServerSideDecoration(bool on)
+{
+    if (on == m_serverSide)
+        return;
+    m_serverSide = on;
+    m_decorationDirty = true;
+    if (m_decoration && m_xdg)
+        m_xdg->scheduleConfigure();
+}
+
 void XdgToplevel::sendRoleConfigure(std::uint32_t serial)
 {
+    if (m_decoration && m_decorationDirty) {
+        m_decoration->sendConfigure(m_serverSide ? XdgToplevelDecoration::Mode::ServerSide
+                                                 : XdgToplevelDecoration::Mode::ClientSide);
+        m_decorationDirty = false;
+    }
     if (!m_sentCapabilities && version() >= 5) {
-        // What the desktop handles; clients hide buttons for the rest (minimize, window menu).
+        // What the desktop handles; clients hide buttons for the rest (window menu).
         wl_array caps;
         wl_array_init(&caps);
-        for (auto cap : {proto::XdgToplevelWmCapabilities::Maximize, proto::XdgToplevelWmCapabilities::Fullscreen}) {
+        for (auto cap : {proto::XdgToplevelWmCapabilities::Maximize, proto::XdgToplevelWmCapabilities::Fullscreen,
+                         proto::XdgToplevelWmCapabilities::Minimize}) {
             if (auto* p = static_cast<std::uint32_t*>(wl_array_add(&caps, sizeof(std::uint32_t))))
                 *p = std::uint32_t(cap);
         }
@@ -629,7 +664,7 @@ void XdgToplevel::handleSetMinimized()
 
 XdgPopup::XdgPopup(wl_client* client, std::uint32_t version, std::uint32_t id, XdgSurface* xdg, XdgSurface* parent,
                    const PositionerState& positioner)
-    : proto::XdgPopup(client, version, id), m_xdg(xdg), m_parent(parent),
+    : proto::XdgPopup(client, version, id), m_xdg(xdg), m_parent(parent), m_positioner(positioner),
       m_geometry(positioner.place(parent ? xdg->server().popupBounds(*parent) : std::nullopt))
 {
     if (parent) {
@@ -644,6 +679,18 @@ XdgPopup::~XdgPopup()
 {
     if (m_xdg)
         m_xdg->roleDestroyed();
+}
+
+void XdgPopup::setForeignParent(Surface* parent)
+{
+    if (m_parent || m_foreignParent || !m_xdg)
+        return; // has a parent already: the client's mistake, keep the first
+    m_foreignParent = parent;
+    m_geometry = m_positioner.place(m_xdg->server().surfacePopupBounds(*parent));
+    m_parentDying = parent->aboutToBeDestroyed.connect([this] {
+        m_foreignParent = nullptr;
+        dismiss();
+    });
 }
 
 void XdgPopup::dismiss()
@@ -671,7 +718,13 @@ void XdgPopup::handleReposition(wl_resource* positioner, std::uint32_t token)
             p->postError(proto::XdgPositionerError::InvalidInput, "positioner needs set_size and set_anchor_rect");
         return;
     }
-    m_geometry = pos->place(m_parent && m_xdg ? m_xdg->server().popupBounds(*m_parent) : std::nullopt);
+    m_positioner = *pos;
+    std::optional<Rect> bounds;
+    if (m_xdg && m_parent)
+        bounds = m_xdg->server().popupBounds(*m_parent);
+    else if (m_xdg && m_foreignParent)
+        bounds = m_xdg->server().surfacePopupBounds(*m_foreignParent);
+    m_geometry = pos->place(bounds);
     m_repositionToken = token;
     if (m_xdg)
         m_xdg->scheduleConfigure();

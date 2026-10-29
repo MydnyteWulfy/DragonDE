@@ -235,3 +235,31 @@ TEST_F(XwaylandTest, NetWmStateRequestsFullscreen)
         return w && w->toplevel->fullscreen() && desktop->geometryOf(*w) == Rect{0, 0, 800, 600};
     })) << "should fill the 800x600 area";
 }
+
+TEST_F(XwaylandTest, X11WindowsGetOurTitleBarUnlessTheyOptOut)
+{
+    WindowStyle style;
+    style.titlebar.height = 30;
+    style.border.width = 0;
+    desktop->setStyleResolver([style](const Toplevel&) { return style; });
+
+    runXClient([this](xcb_connection_t* c) {
+        createXWindow(c, "framed", 10, 10, 200, 150);
+        const xcb_window_t bare = createXWindow(c, "frameless", 10, 10, 200, 150);
+        // _MOTIF_WM_HINTS: flags = decorations, decorations = none (like Chrome or Steam).
+        const std::uint32_t hints[5] = {2, 0, 0, 0, 0};
+        const xcb_atom_t motif = atom(c, "_MOTIF_WM_HINTS");
+        xcb_change_property(c, XCB_PROP_MODE_REPLACE, bare, motif, motif, 32, 5, hints);
+        xcb_flush(c);
+        waitFor(c, XCB_DESTROY_NOTIFY, stopClient);
+    });
+
+    ASSERT_TRUE(pumpUntil([this] {
+        auto* framed = windowTitled("framed");
+        auto* bare = windowTitled("frameless");
+        return framed && bare && framed->titlebar && !bare->titlebar;
+    })) << "the window with Motif 'no decorations' keeps none";
+    // The title bar sits above the X window, which stays where X thinks it is.
+    Desktop::Window* framed = windowTitled("framed");
+    EXPECT_EQ(desktop->frameOf(*framed).titlebar.y + 30, desktop->geometryOf(*framed).y);
+}

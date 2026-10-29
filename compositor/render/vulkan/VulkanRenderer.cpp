@@ -26,10 +26,36 @@ constexpr std::uint32_t kTextureFrag[] = {
 struct QuadPush {
     float rect[4]; // NDC x, y, width, height
     float uv[4];
+    float clipRect[4];
+    float shapeRect[4];
+    float color1[4];
+    float color2[4];
+    float clipRadius;
     float alpha;
+    float shapeRadius;
+    float shapeSize;
+    float angle;
+    std::uint32_t mode;
     std::uint32_t opaque;
+    float pad;
 };
-static_assert(sizeof(QuadPush) == 40);
+// The minimum every Vulkan implementation supports.
+static_assert(sizeof(QuadPush) == 128);
+
+// `mode` in the shader: the kind of draw, plus flags.
+constexpr std::uint32_t kModeTexture = 0, kModeShadow = 1, kModeBorder = 2, kModeFill = 3, kModeBlurDown = 4,
+                        kModeBlurUp = 5, kModeBlurFinish = 6;
+constexpr std::uint32_t kInvertClip = 8, kHasMask = 16;
+
+void copy4(float (&dst)[4], const Rect& r)
+{
+    dst[0] = float(r.x), dst[1] = float(r.y), dst[2] = float(r.width), dst[3] = float(r.height);
+}
+
+void copy4(float (&dst)[4], const std::array<float, 4>& v)
+{
+    std::copy(v.begin(), v.end(), dst);
+}
 
 VkShaderModule createShader(VkDevice dev, std::span<const std::uint32_t> code)
 {
@@ -52,11 +78,15 @@ std::unique_ptr<VulkanRenderer> VulkanRenderer::create(VulkanDevice& device)
     return r;
 }
 
+VulkanRenderer::VulkanRenderer(VulkanDevice& device) : m_device(device) {}
+
 VulkanRenderer::~VulkanRenderer()
 {
     VkDevice dev = m_device.device();
     if (m_fence)
         vkWaitForFences(dev, 1, &m_fence, VK_TRUE, UINT64_MAX);
+    m_blank.reset();
+    destroyScratch();
     for (auto& [format, pipeline] : m_pipelines)
         vkDestroyPipeline(dev, pipeline, nullptr);
     vkDestroyShaderModule(dev, m_fragShader, nullptr);
@@ -144,18 +174,22 @@ bool VulkanRenderer::createPipelineLayout()
         return false;
 
     // One texture, pushed per draw (VK_KHR_push_descriptor): no pools, no sets to manage.
-    VkDescriptorSetLayoutBinding binding{
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .pImmutableSamplers = &m_sampler,
-    };
+    // Binding 1: a mask (blur only where a layer surface is opaque enough).
+    VkDescriptorSetLayoutBinding bindings[2];
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        bindings[i] = {
+            .binding = i,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = &m_sampler,
+        };
+    }
     VkDescriptorSetLayoutCreateInfo setInfo{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-        .bindingCount = 1,
-        .pBindings = &binding,
+        .bindingCount = 2,
+        .pBindings = bindings,
     };
     if (!check(vkCreateDescriptorSetLayout(dev, &setInfo, nullptr, &m_setLayout), "vkCreateDescriptorSetLayout"))
         return false;
@@ -177,7 +211,16 @@ bool VulkanRenderer::createPipelineLayout()
 
     m_vertShader = createShader(dev, kQuadVert);
     m_fragShader = createShader(dev, kTextureFrag);
-    return m_vertShader && m_fragShader;
+    if (!m_vertShader || !m_fragShader)
+        return false;
+
+    m_blank = createTexture(1, 1, VK_FORMAT_B8G8R8A8_UNORM, false);
+    if (!m_blank)
+        return false;
+    const std::uint32_t transparent = 0;
+    const Rect all{0, 0, 1, 1};
+    m_blank->write(&transparent, 4, {&all, 1});
+    return true;
 }
 
 VkPipeline VulkanRenderer::pipelineFor(VkFormat format)
@@ -304,6 +347,109 @@ std::unique_ptr<VulkanTexture> VulkanRenderer::importTexture(const DmaBuf& buffe
     return tex;
 }
 
+// ----------------------------------------------------------------- scratch --
+
+struct VulkanRenderer::Scratch {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkExtent2D extent{};
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkDevice device = VK_NULL_HANDLE;
+
+    ~Scratch()
+    {
+        vkDestroyImageView(device, view, nullptr);
+        vkDestroyImage(device, image, nullptr);
+        vkFreeMemory(device, memory, nullptr);
+    }
+};
+
+bool VulkanRenderer::ensureScratch(std::unique_ptr<Scratch>& out, VkExtent2D extent, VkFormat format, const char* name)
+{
+    if (out && out->extent.width == extent.width && out->extent.height == extent.height && out->format == format)
+        return true;
+    waitIdle(); // the old one may still be in use
+    out.reset();
+    VkDevice dev = m_device.device();
+    auto img = std::make_unique<Scratch>();
+    img->device = dev;
+    img->extent = extent;
+    img->format = format;
+    VkImageCreateInfo info{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent = {extent.width, extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    if (!check(vkCreateImage(dev, &info, nullptr, &img->image), name))
+        return false;
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(dev, img->image, &req);
+    auto type = m_device.findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!type)
+        return false;
+    VkMemoryAllocateInfo alloc{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = *type};
+    if (!check(vkAllocateMemory(dev, &alloc, nullptr, &img->memory), name) ||
+        !check(vkBindImageMemory(dev, img->image, img->memory, 0), name))
+        return false;
+    VkImageViewCreateInfo viewInfo{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = img->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = format,
+        .subresourceRange = kColorRange,
+    };
+    if (!check(vkCreateImageView(dev, &viewInfo, nullptr, &img->view), name))
+        return false;
+    out = std::move(img);
+    return true;
+}
+
+void VulkanRenderer::transition(Scratch& img, VkImageLayout layout)
+{
+    if (img.layout == layout)
+        return;
+    // Offscreen work is small and strictly ordered: a full barrier keeps it simple.
+    VkImageMemoryBarrier2 barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .oldLayout = img.layout,
+        .newLayout = layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img.image,
+        .subresourceRange = kColorRange,
+    };
+    VkDependencyInfo dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                         .pImageMemoryBarriers = &barrier};
+    vkCmdPipelineBarrier2(m_cmd, &dep);
+    img.layout = layout;
+}
+
+void VulkanRenderer::destroyScratch()
+{
+    m_scene.reset();
+    m_levels.clear();
+    m_blurOut.reset();
+    m_capture.reset();
+}
+
+// ------------------------------------------------------------------ frames --
+
 bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std::span<const TextureDraw> draws)
 {
     // One frame in flight for now; the frame pacing work will add more.
@@ -319,9 +465,17 @@ bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std:
 
     // Client dma-bufs: reading, so wait for the client's rendering (writers) only.
     std::vector<VulkanTexture*> imported;
+    auto noteTexture = [&imported](VulkanTexture* t) {
+        if (t && t->imported() && std::ranges::find(imported, t) == imported.end())
+            imported.push_back(t);
+    };
+    bool offscreen = false;
     for (const auto& d : draws) {
-        if (d.texture->imported() && std::ranges::find(imported, d.texture) == imported.end())
-            imported.push_back(d.texture);
+        noteTexture(d.texture);
+        if (d.backdrop) {
+            noteTexture(d.backdrop->mask);
+            offscreen = true;
+        }
     }
     while (m_textureWaits.size() < imported.size()) {
         VkSemaphoreCreateInfo info{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -336,6 +490,11 @@ bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std:
                              .stageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT});
     }
 
+    const VkExtent2D extent = target.extent();
+    const VkFormat format = target.format();
+    if (offscreen && !ensureScratch(m_scene, extent, format, "scene image"))
+        offscreen = false; // no blur this frame, but still a frame
+
     vkResetCommandBuffer(m_cmd, 0);
     VkCommandBufferBeginInfo begin{
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -344,8 +503,13 @@ bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std:
     vkBeginCommandBuffer(m_cmd, &begin);
 
     const std::uint64_t frame = m_submitted + 1;
-    for (const auto& d : draws)
-        d.texture->recordUpload(m_cmd, frame);
+    m_blank->recordUpload(m_cmd, frame);
+    for (const auto& d : draws) {
+        if (d.texture)
+            d.texture->recordUpload(m_cmd, frame);
+        if (d.backdrop && d.backdrop->mask)
+            d.backdrop->mask->recordUpload(m_cmd, frame);
+    }
 
     // Acquire everything other processes own: our target (UNDEFINED: we
     // overwrite every pixel) and client images (GENERAL: keep their content).
@@ -385,65 +549,237 @@ bool VulkanRenderer::render(VulkanImage& target, std::array<float, 4> rgba, std:
     };
     vkCmdPipelineBarrier2(m_cmd, &acquireDep);
 
-    VkRenderingAttachmentInfo color{
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = target.view(),
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = {.color = {.float32 = {rgba[0], rgba[1], rgba[2], rgba[3]}}},
-    };
-    VkRenderingInfo rendering{
-        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea = {{0, 0}, target.extent()},
-        .layerCount = 1,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &color,
-    };
-    vkCmdBeginRendering(m_cmd, &rendering);
-
-    if (!draws.empty()) {
-        const VkExtent2D extent = target.extent();
-        if (VkPipeline pipeline = pipelineFor(target.format())) {
-            vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            const VkViewport vp{0.0f, 0.0f, float(extent.width), float(extent.height), 0.0f, 1.0f};
-            const VkRect2D scissor{{0, 0}, extent};
-            vkCmdSetViewport(m_cmd, 0, 1, &vp);
-            vkCmdSetScissor(m_cmd, 0, 1, &scissor);
-
-            const float sx = 2.0f / float(extent.width), sy = 2.0f / float(extent.height);
-            for (const auto& d : draws) {
-                if (!d.texture->ready())
-                    continue;
-                VkDescriptorImageInfo image{
-                    .imageView = d.texture->m_view,
-                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                };
-                VkWriteDescriptorSet write{
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstBinding = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                    .pImageInfo = &image,
-                };
-                m_device.fn().cmdPushDescriptorSetKHR(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0,
-                                                      1, &write);
-                const QuadPush push{
-                    .rect = {float(d.dst.x) * sx - 1.0f, float(d.dst.y) * sy - 1.0f, float(d.dst.width) * sx,
-                             float(d.dst.height) * sy},
-                    .uv = {0.0f, 0.0f, 1.0f, 1.0f},
-                    .alpha = d.alpha,
-                    .opaque = d.texture->opaque() ? 1u : 0u,
-                };
-                vkCmdPushConstants(m_cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                                   0, sizeof(push), &push);
-                vkCmdDraw(m_cmd, 4, 1, 0, 0);
-                d.texture->m_lastUsedFrame = frame;
-            }
-        }
+    VkPipeline pipeline = pipelineFor(format);
+    if (!pipeline) {
+        vkEndCommandBuffer(m_cmd);
+        return false;
     }
 
+    // Starts rendering into `view` (`area` of an `ext`-sized image) and sets up the pipeline.
+    auto beginPass = [&](VkImageView view, VkExtent2D ext, VkImageLayout layout, VkAttachmentLoadOp load,
+                         const Rect& area, std::array<float, 4> clear) {
+        VkRenderingAttachmentInfo color{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = view,
+            .imageLayout = layout,
+            .loadOp = load,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {.color = {.float32 = {clear[0], clear[1], clear[2], clear[3]}}},
+        };
+        VkRenderingInfo info{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = {{area.x, area.y}, {std::uint32_t(area.width), std::uint32_t(area.height)}},
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &color,
+        };
+        vkCmdBeginRendering(m_cmd, &info);
+        vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        const VkViewport vp{0.0f, 0.0f, float(ext.width), float(ext.height), 0.0f, 1.0f};
+        vkCmdSetViewport(m_cmd, 0, 1, &vp);
+        const VkRect2D sc{{area.x, area.y}, {std::uint32_t(area.width), std::uint32_t(area.height)}};
+        vkCmdSetScissor(m_cmd, 0, 1, &sc);
+    };
+    // One quad: `push.rect` in NDC; samples `view` (and `maskView`).
+    auto drawQuad = [&](QuadPush& push, VkImageView view, VkImageView maskView) {
+        VkDescriptorImageInfo images[2] = {
+            {.imageView = view, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {.imageView = maskView, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        };
+        VkWriteDescriptorSet writes[2];
+        for (std::uint32_t i = 0; i < 2; ++i) {
+            writes[i] = {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstBinding = i,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &images[i],
+            };
+        }
+        m_device.fn().cmdPushDescriptorSetKHR(m_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 2,
+                                              writes);
+        vkCmdPushConstants(m_cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(push), &push);
+        vkCmdDraw(m_cmd, 4, 1, 0, 0);
+    };
+    auto ndc = [](const Rect& r, VkExtent2D ext, float (&out)[4]) {
+        const float sx = 2.0f / float(ext.width), sy = 2.0f / float(ext.height);
+        out[0] = float(r.x) * sx - 1.0f, out[1] = float(r.y) * sy - 1.0f;
+        out[2] = float(r.width) * sx, out[3] = float(r.height) * sy;
+    };
+    auto uvOf = [](const Rect& r, VkExtent2D ext, float (&out)[4]) {
+        out[0] = float(r.x) / float(ext.width), out[1] = float(r.y) / float(ext.height);
+        out[2] = float(r.x + r.width) / float(ext.width), out[3] = float(r.y + r.height) / float(ext.height);
+    };
+
+    const Rect full{0, 0, std::int32_t(extent.width), std::int32_t(extent.height)};
+    VkImageView sceneView = offscreen ? m_scene->view : target.view();
+    auto beginScene = [&](VkAttachmentLoadOp load) {
+        if (offscreen)
+            transition(*m_scene, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        beginPass(sceneView, extent, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, load, full, rgba);
+    };
+
+    // Dual Kawase: down `passes` times by halves, then back up to half size,
+    // all limited to `region` plus the blur's reach. Result: m_blurOut.
+    auto blurChain = [&](const Rect& region, const BlurParams& p) -> bool {
+        const int passes = std::clamp(p.passes, 1, 6);
+        // Only ever grows: a smaller blur later in the frame must not free
+        // levels the command buffer already uses.
+        if (m_levels.size() < std::size_t(passes))
+            m_levels.resize(std::size_t(passes));
+        for (int i = 0; i < passes; ++i) {
+            const VkExtent2D e{std::max(1u, extent.width >> (i + 1)), std::max(1u, extent.height >> (i + 1))};
+            if (!ensureScratch(m_levels[std::size_t(i)], e, format, "blur level"))
+                return false;
+        }
+        if (!ensureScratch(m_blurOut, m_levels[0]->extent, format, "blur output"))
+            return false;
+        const std::int32_t reach = p.size * (2 << passes);
+        const Rect work = region.adjusted(reach).intersected(full);
+        auto scaled = [&](int level, VkExtent2D e) { // `work` in a level's pixels, rounded outward
+            const int f = 1 << level;
+            const std::int32_t x0 = work.x / f, y0 = work.y / f;
+            const std::int32_t x1 = (work.x + work.width + f - 1) / f, y1 = (work.y + work.height + f - 1) / f;
+            return Rect{x0, y0, std::min(x1, std::int32_t(e.width)) - x0, std::min(y1, std::int32_t(e.height)) - y0};
+        };
+        auto pass = [&](Scratch& src, VkExtent2D srcExt, Scratch& dst, int level, std::uint32_t mode) {
+            transition(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            transition(dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            const Rect area = scaled(level, dst.extent);
+            if (area.width <= 0 || area.height <= 0)
+                return;
+            beginPass(dst.view, dst.extent, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR,
+                      area, {0, 0, 0, 1});
+            QuadPush push{.alpha = 1.0f, .mode = mode};
+            ndc(area, dst.extent, push.rect);
+            uvOf(area, dst.extent, push.uv);
+            push.color1[0] = 1.0f / float(srcExt.width);
+            push.color1[1] = 1.0f / float(srcExt.height);
+            push.color1[2] = float(p.size);
+            drawQuad(push, src.view, m_blank->m_view);
+            vkCmdEndRendering(m_cmd);
+        };
+        Scratch* src = m_scene.get();
+        for (int i = 0; i < passes; ++i) {
+            pass(*src, src->extent, *m_levels[std::size_t(i)], i + 1, kModeBlurDown);
+            src = m_levels[std::size_t(i)].get();
+        }
+        for (int i = passes - 1; i >= 1; --i) {
+            pass(*src, src->extent, *m_levels[std::size_t(i - 1)], i, kModeBlurUp);
+            src = m_levels[std::size_t(i - 1)].get();
+        }
+        pass(*src, src->extent, *m_blurOut, 1, kModeBlurUp);
+        transition(*m_blurOut, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        return true;
+    };
+    // The blurred backdrop, back into the scene.
+    auto drawBlurred = [&](const TextureDraw& d, Scratch& blurred) {
+        const BackdropDraw& b = *d.backdrop;
+        QuadPush push{.alpha = d.alpha, .mode = kModeBlurFinish};
+        const Rect dst = b.region.rect.intersected(full);
+        if (dst.width <= 0 || dst.height <= 0)
+            return;
+        ndc(dst, extent, push.rect);
+        uvOf(dst, extent, push.uv); // blur images cover the whole frame, at half size
+        copy4(push.clipRect, b.region.rect);
+        push.clipRadius = b.region.radius;
+        push.color1[0] = b.params.noise;
+        push.color1[1] = b.params.contrast;
+        push.color1[2] = b.params.brightness;
+        push.color1[3] = b.params.vibrancy;
+        VkImageView maskView = m_blank->m_view;
+        if (b.mask && b.mask->ready()) {
+            push.mode |= kHasMask;
+            copy4(push.shapeRect, b.maskRect);
+            push.shapeSize = b.maskThreshold;
+            maskView = b.mask->m_view;
+            b.mask->m_lastUsedFrame = frame;
+        }
+        drawQuad(push, blurred.view, maskView);
+    };
+
+    if (offscreen)
+        m_scene->layout = VK_IMAGE_LAYOUT_UNDEFINED; // cleared anyway
+    beginScene(VK_ATTACHMENT_LOAD_OP_CLEAR);
+    for (const auto& d : draws) {
+        if (d.backdrop) {
+            if (!offscreen)
+                continue;
+            if (d.captureBackdrop || !d.backdrop->fromCapture) {
+                vkCmdEndRendering(m_cmd);
+                const bool ok = blurChain(d.captureBackdrop ? full : d.backdrop->region.rect, d.backdrop->params);
+                if (ok && d.captureBackdrop && ensureScratch(m_capture, m_blurOut->extent, format, "blur capture")) {
+                    transition(*m_blurOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                    transition(*m_capture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    const VkImageCopy region{
+                        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .extent = {m_capture->extent.width, m_capture->extent.height, 1},
+                    };
+                    vkCmdCopyImage(m_cmd, m_blurOut->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_capture->image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                    transition(*m_capture, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    transition(*m_blurOut, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                }
+                beginScene(VK_ATTACHMENT_LOAD_OP_LOAD);
+                if (ok && !d.captureBackdrop)
+                    drawBlurred(d, *m_blurOut);
+            } else if (m_capture && m_capture->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                drawBlurred(d, *m_capture);
+            }
+            continue;
+        }
+
+        VulkanTexture* texture = d.texture ? d.texture : m_blank.get();
+        if (!texture->ready())
+            continue;
+        const Rect sc = d.scissor ? d.scissor->intersected(full) : full;
+        if (sc.width <= 0 || sc.height <= 0)
+            continue;
+        const VkRect2D scissor{{sc.x, sc.y}, {std::uint32_t(sc.width), std::uint32_t(sc.height)}};
+        vkCmdSetScissor(m_cmd, 0, 1, &scissor);
+        QuadPush push{
+            .uv = {0.0f, 0.0f, 1.0f, 1.0f},
+            .alpha = d.alpha,
+            .opaque = texture->opaque() ? 1u : 0u,
+        };
+        ndc(d.dst, extent, push.rect);
+        if (d.clip) {
+            copy4(push.clipRect, d.clip->rect);
+            push.clipRadius = d.clip->radius;
+            if (d.invertClip)
+                push.mode |= kInvertClip;
+        }
+        if (!d.texture) {
+            using Kind = ShapeDraw::Kind;
+            push.mode |= d.shape.kind == Kind::Shadow ? kModeShadow : d.shape.kind == Kind::Fill ? kModeFill : kModeBorder;
+            copy4(push.shapeRect, d.shape.rect.rect);
+            push.shapeRadius = d.shape.rect.radius;
+            push.shapeSize = std::max(d.shape.size, 0.5f);
+            copy4(push.color1, d.shape.color);
+            copy4(push.color2, d.shape.color2);
+            push.angle = d.shape.angle;
+        } else {
+            push.mode |= kModeTexture;
+        }
+        drawQuad(push, texture->m_view, m_blank->m_view);
+        const VkRect2D all{{0, 0}, extent};
+        vkCmdSetScissor(m_cmd, 0, 1, &all);
+        texture->m_lastUsedFrame = frame;
+    }
     vkCmdEndRendering(m_cmd);
+
+    // The offscreen frame onto the real target.
+    if (offscreen) {
+        transition(*m_scene, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        beginPass(target.view(), extent, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                  full, rgba);
+        QuadPush push{.uv = {0.0f, 0.0f, 1.0f, 1.0f}, .alpha = 1.0f, .mode = kModeTexture, .opaque = 1u};
+        ndc(full, extent, push.rect);
+        drawQuad(push, m_scene->view, m_blank->m_view);
+        vkCmdEndRendering(m_cmd);
+    }
 
     // Hand everything back to FOREIGN in GENERAL, the layout other processes expect.
     std::vector<VkImageMemoryBarrier2> release;

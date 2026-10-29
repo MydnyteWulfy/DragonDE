@@ -42,12 +42,19 @@ public:
     // XKB text keymap (e.g. the nested parent's). Starts with the XKB defaults
     // ($XKB_DEFAULT_LAYOUT etc., else US).
     bool setKeymap(const std::string& keymap);
+    // Compiles a keymap from XKB names (empty fields: the defaults).
+    bool setKeymapNames(const std::string& layout, const std::string& variant, const std::string& options,
+                        const std::string& model);
+    void setRepeatInfo(std::int32_t rate, std::int32_t delay);
     void setKeyboardFocus(Surface* surface);
     Surface* keyboardFocus() const { return m_keyboardFocus; }
     // evdev keycode; updates modifier state and tells the focused client.
     void notifyKey(std::uint32_t timeMs, std::uint32_t key, bool pressed);
     // Super/Alt/Ctrl/Shift currently held, as XKB effective modifier names.
     bool modifierActive(const char* name) const;
+    // The key's unshifted symbol in the active layout, lowercased (for shortcuts:
+    // Mod+Shift+2 stays "2", not "@"). 0 if it has none.
+    std::uint32_t baseKeysym(std::uint32_t key) const;
 
     // ------------------------------------------------------------- pointer --
     // Moves pointer focus (enter/leave). Null: the pointer is over nothing.
@@ -70,6 +77,9 @@ public:
     // minus `hotspot` (the backend's cursor is hidden meanwhile).
     void requestCursorSurface(wl_client* client, std::uint32_t serial, Surface* surface, Point hotspot);
     Signal<std::uint32_t> cursorShapeChanged;
+    // The compositor's own cursor (wp_cursor_shape values) while no client
+    // has pointer focus: resize arrows over window borders, ...
+    void setCursorShape(std::uint32_t shape);
     // Non-null while a client cursor image is showing.
     Surface* cursorSurface() const { return m_cursorSurface; }
     Point cursorHotspot() const { return m_cursorHotspot; }
@@ -135,6 +145,8 @@ private:
     xkb_state* m_xkbState = nullptr;
     UniqueFd m_keymapFd; // sealed memfd shared with every client
     std::uint32_t m_keymapSize = 0;
+    std::int32_t m_repeatRate = 25;   // keys per second
+    std::int32_t m_repeatDelay = 600; // ms
     std::vector<std::uint32_t> m_pressedKeys;
     std::uint32_t m_modsSent[4] = {};
 
@@ -154,7 +166,6 @@ private:
     Point m_cursorHotspot;
     Connection m_cursorSurfaceGone;
     Connection m_cursorSurfaceCommitted;
-    void setCursorShape(std::uint32_t shape);
     void clearCursorSurface();
     std::vector<std::uint32_t> m_pressedButtons;
     std::uint32_t m_lastButtonSerial = 0;

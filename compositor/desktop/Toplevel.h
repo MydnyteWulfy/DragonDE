@@ -36,9 +36,18 @@ public:
     virtual void setMaximized(bool on) = 0;
     virtual void setFullscreen(bool on) = 0;
     virtual void setResizing(bool on) = 0;
+    // Hidden from the screen (X11 clients track this; xdg has no such state).
+    virtual void setMinimized(bool) {}
     virtual void setBounds(Size bounds) = 0;
     // Asks the client to close (it may refuse or ask the user first).
     virtual void close() = 0;
+    // Title bars: can the compositor draw this window's (the client then
+    // leaves its own out)? Wayland: clients that speak xdg-decoration; X11:
+    // windows that don't ask for no decorations (Motif hints).
+    virtual bool canServerDecorate() const { return false; }
+    // Tells the client who draws the title bar.
+    virtual void setServerDecorated(bool) {}
+
     // Where the desktop put the window's geometry (X11 clients position themselves by it).
     virtual void setPosition(Point) {}
     // The window went to the top of the stack.
@@ -52,8 +61,12 @@ public:
     // it answers (Wayland); X11 sends none and relies on a held button.
     Signal<std::optional<std::uint32_t>> moveRequested;
     Signal<std::optional<std::uint32_t>, std::uint32_t> resizeRequested; // serial, xdg resize edges
+    Signal<> minimizeRequested;
     Signal<bool> maximizeRequested;
     Signal<bool> fullscreenRequested;
+    Signal<> titleChanged;
+    Signal<> appIdChanged;
+    Signal<> decorationChanged; // canServerDecorate() may differ now
 };
 
 } // namespace dragon

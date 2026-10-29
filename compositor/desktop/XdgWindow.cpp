@@ -21,6 +21,10 @@ XdgWindow::XdgWindow(XdgToplevel& toplevel) : m_toplevel(toplevel)
     m_connections.push_back(toplevel.resizeRequested.connect([this](std::uint32_t serial, proto::XdgToplevelResizeEdge e) {
         resizeRequested.emit(serial, std::uint32_t(e));
     }));
+    m_connections.push_back(toplevel.titleChanged.connect([this] { titleChanged.emit(); }));
+    m_connections.push_back(toplevel.appIdChanged.connect([this] { appIdChanged.emit(); }));
+    m_connections.push_back(toplevel.decorationChanged.connect([this] { decorationChanged.emit(); }));
+    m_connections.push_back(toplevel.minimizeRequested.connect([this] { minimizeRequested.emit(); }));
     m_connections.push_back(toplevel.maximizeRequested.connect([this](bool on) { maximizeRequested.emit(on); }));
     m_connections.push_back(toplevel.fullscreenRequested.connect([this](bool on) { fullscreenRequested.emit(on); }));
     // ~XdgToplevel unmaps first (roleDestroyed), then `destroyed` fires.
@@ -28,6 +32,16 @@ XdgWindow::XdgWindow(XdgToplevel& toplevel) : m_toplevel(toplevel)
 }
 
 XdgWindow::~XdgWindow() = default;
+
+bool XdgWindow::canServerDecorate() const
+{
+    return m_toplevel.decoration() != nullptr;
+}
+
+void XdgWindow::setServerDecorated(bool on)
+{
+    m_toplevel.setServerSideDecoration(on);
+}
 
 Surface* XdgWindow::surface() const
 {

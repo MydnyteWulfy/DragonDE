@@ -88,6 +88,16 @@ const std::set<std::string_view> kKeywords = {
     "resource", "client", "version", "id", "self",
 };
 
+// The real keywords in kKeywords (the rest are only names we use ourselves).
+const std::set<std::string, std::less<>> kCppKeywords = [] {
+    std::set<std::string, std::less<>> out;
+    for (auto k : kKeywords) {
+        if (k != "resource" && k != "client" && k != "version" && k != "id" && k != "self")
+            out.emplace(k);
+    }
+    return out;
+}();
+
 std::string pascal(std::string_view snake)
 {
     std::string out;
@@ -364,9 +374,28 @@ std::string Generator::header(const std::string& cHeader) const
       << "#include \"wayland/Bitfield.h\"\n"
       << "#include \"wayland/Resource.h\"\n\n"
       << "#include <cstdint>\n"
-      << "#include <string_view>\n"
-      << "#include <" << cHeader << ">\n\n"
-      << "namespace dragon::proto {\n";
+      << "#include <string_view>\n";
+    // wayland-scanner's C header uses argument names as they are; C++
+    // keywords among them (layer-shell's `namespace`) must be renamed around it.
+    std::set<std::string> renamed;
+    for (const auto& iface : m_proto.interfaces) {
+        for (const auto* list : {&iface.requests, &iface.events}) {
+            for (const auto& m : *list) {
+                for (const auto& a : m.args) {
+                    if (kCppKeywords.contains(a.name))
+                        renamed.insert(a.name);
+                }
+            }
+        }
+    }
+    if (!renamed.empty())
+        o << "#include <cstddef>\n#include <wayland-server.h> // before the renaming below\n";
+    for (const auto& k : renamed)
+        o << "#define " << k << " " << k << "_\n";
+    o << "#include <" << cHeader << ">\n";
+    for (const auto& k : renamed)
+        o << "#undef " << k << "\n";
+    o << "\nnamespace dragon::proto {\n";
 
     // Enums first, at namespace scope, so any class can use any enum regardless of order.
     for (const auto& iface : m_proto.interfaces) {

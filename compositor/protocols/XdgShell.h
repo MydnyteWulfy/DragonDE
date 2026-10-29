@@ -17,6 +17,7 @@ class Server;
 class XdgPopup;
 class XdgSurface;
 class XdgToplevel;
+class XdgToplevelDecoration;
 
 struct PositionerState {
     Size size;
@@ -197,6 +198,14 @@ public:
     // Asks the client to close (it may refuse or ask the user first).
     void requestClose() { sendClose(); }
 
+    // xdg-decoration: the client's decoration object, if it made one (it then
+    // draws no title bar of its own when told so).
+    XdgToplevelDecoration* decoration() const { return m_decoration; }
+    // Who draws the title bar; sent with the next configure. Only clients with
+    // a decoration object can be told; the rest always decorate themselves.
+    void setServerSideDecoration(bool on);
+    bool serverSideDecoration() const { return m_decoration && m_serverSide; }
+
     Signal<> titleChanged;
     Signal<> appIdChanged;
     Signal<std::uint32_t> moveRequested;                                   // serial
@@ -204,6 +213,8 @@ public:
     Signal<bool> maximizeRequested;                                       // true: maximize
     Signal<bool> fullscreenRequested;
     Signal<> minimizeRequested;
+    // A decoration object came or went, or the client changed its preference.
+    Signal<> decorationChanged;
 
 protected:
     void handleSetParent(wl_resource* parent) override;
@@ -222,6 +233,9 @@ protected:
 
 private:
     friend class XdgSurface;
+    friend class XdgToplevelDecoration;
+    void attachDecoration(XdgToplevelDecoration* decoration);
+    void decorationRequested();
 
     // XdgRole
     void sendRoleConfigure(std::uint32_t serial) override;
@@ -241,6 +255,9 @@ private:
     Configure m_current;
     std::vector<std::pair<std::uint32_t, Configure>> m_inflight;
     bool m_sentCapabilities = false;
+    XdgToplevelDecoration* m_decoration = nullptr;
+    bool m_serverSide = false;
+    bool m_decorationDirty = false; // the mode needs (re)sending
     Size m_bounds;
     bool m_boundsChanged = false;
 };
@@ -253,6 +270,10 @@ public:
 
     XdgSurface* xdgSurface() const { return m_xdg; }
     XdgSurface* parent() const { return m_parent; }
+    // A parent that isn't an xdg_surface (layer-shell's get_popup): set on a
+    // popup created without a parent. Its origin is the reference point.
+    Surface* foreignParent() const { return m_foreignParent; }
+    void setForeignParent(Surface* parent);
     // Relative to the parent's window geometry.
     Rect geometry() const { return m_geometry; }
 
@@ -276,6 +297,8 @@ private:
 
     XdgSurface* m_xdg;
     XdgSurface* m_parent;
+    Surface* m_foreignParent = nullptr;
+    PositionerState m_positioner;
     Rect m_geometry;
     std::optional<std::uint32_t> m_repositionToken;
     std::optional<std::uint32_t> m_grabSerial;

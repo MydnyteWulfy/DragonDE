@@ -1,7 +1,9 @@
 #include "Server.h"
 #include "backend/headless/HeadlessBackend.h"
 #include "backend/nested/NestedBackend.h"
+#include "config/Config.h"
 #include "core/EventLoop.h"
+#include "core/FileWatcher.h"
 #include "core/Log.h"
 #include "core/Process.h"
 #include "core/SessionBus.h"
@@ -9,6 +11,8 @@
 #include "desktop/InputRouter.h"
 #include "desktop/OutputRenderer.h"
 #include "desktop/SurfaceTextures.h"
+#include "desktop/Toplevel.h"
+#include "protocols/LayerShell.h"
 #include "protocols/Seat.h"
 #include "protocols/XdgActivation.h"
 #include "protocols/LinuxDmabuf.h"
@@ -21,7 +25,9 @@
 #include <csignal>
 #include <cstdlib>
 #include <cmath>
+#include <filesystem>
 #include <format>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string_view>
@@ -129,6 +135,57 @@ int main()
         dmabuf.formats.push_back({format, modifier});
     server.enableDmabuf(std::move(dmabuf));
 
+    // The user's config.lua: settings and shortcuts. Reloaded when it's saved
+    // (or Mod+Shift+R); a broken file keeps the previous configuration.
+    const auto configPath = env("DRAGON_CONFIG").empty() ? Config::defaultPath()
+                                                         : std::filesystem::path(env("DRAGON_CONFIG"));
+    std::function<void()> reloadConfig;
+    ConfigActions actions{
+        .spawn =
+            [&server](const std::string& cmd) {
+                // A launch token lets the app take focus once it shows up, however slowly.
+                const auto token = server.activation().createCompositorToken();
+                process::spawn(cmd, {"XDG_ACTIVATION_TOKEN=" + token, "DESKTOP_STARTUP_ID=" + token});
+            },
+        .quit =
+            [&] {
+                log::info("core", "quit shortcut");
+                quit();
+            },
+        // Never reload from inside the running config: its Lua state would go away.
+        .reload = [&] { loop.addIdle([&] { reloadConfig(); }); },
+    };
+    addWindowActions(actions, desktop);
+    Config config(std::move(actions));
+    // Modifier "auto": Super, except nested where the parent compositor
+    // usually keeps Super shortcuts (like Super+drag) for itself.
+    const bool nested = std::string_view(backend->name()) == "nested";
+    if (const auto mod = env("DRAGON_MOD"); !mod.empty())
+        config.setAutoModifier(std::string(mod));
+    else if (nested)
+        config.setAutoModifier("alt");
+    reloadConfig = [&] {
+        if (config.loadFile(configPath))
+            log::info("core", "config loaded from {} (modifier {}, terminal {})", configPath.string(),
+                      config.modifier(), config.settings().terminal);
+    };
+    reloadConfig();
+    FileWatcher configWatcher(loop, configPath);
+    auto configEdited = configWatcher.changed.connect([&] { reloadConfig(); });
+    auto applyRenderSettings = [&] {
+        for (auto& [output, renderer] : renderers) {
+            renderer->setBackground(config.settings().background.rgba());
+            renderer->setWallpaper(config.settings().wallpaper);
+        }
+        desktop.restyle();
+    };
+    // Every window's look: the config's `windows` style plus matching rules.
+    desktop.setStyleResolver(
+        [&config](const Toplevel& toplevel) { return config.styleFor(toplevel.appId(), toplevel.title()); });
+    desktop.setLayerStyleResolver([&config](const LayerSurface& s) { return config.layerStyleFor(s.nameSpace()); });
+    auto configChanged = config.changed.connect(applyRenderSettings);
+    applyRenderSettings();
+
     // Client cursor images are drawn by us, above everything (set up once input exists).
     OutputRenderer::OverlayProvider cursorOverlay;
     OutputRenderer::OverlayProvider dragIconOverlay;
@@ -142,6 +199,8 @@ int main()
                 .first->second;
         renderer->addOverlay([&dragIconOverlay] { return dragIconOverlay ? dragIconOverlay() : std::nullopt; });
         renderer->addOverlay([&cursorOverlay] { return cursorOverlay ? cursorOverlay() : std::nullopt; });
+        renderer->setBackground(config.settings().background.rgba());
+        renderer->setWallpaper(config.settings().wallpaper);
         if (renderers.size() == 1) {
             auto updateArea = [&desktop, output] {
                 desktop.setArea({0, 0, output->mode().width, output->mode().height});
@@ -156,23 +215,7 @@ int main()
     });
     auto backendQuit = backend->quitRequested.connect(quit);
     auto cursor = server.seat().cursorShapeChanged.connect([&](std::uint32_t shape) { backend->setCursorShape(shape); });
-    // Shortcut modifier: Super, except nested where the parent compositor
-    // usually keeps Super shortcuts (like Super+drag) for itself.
-    WindowManagerConfig wm;
-    const auto mod = env("DRAGON_MOD");
-    const bool nested = std::string_view(backend->name()) == "nested";
-    if (mod == "alt" || (mod.empty() && nested))
-        wm.modifier = "Mod1", wm.modifierLabel = "Alt";
-    else if (mod == "ctrl")
-        wm.modifier = "Control", wm.modifierLabel = "Ctrl";
-    if (const auto terminal = env("DRAGON_TERMINAL"); !terminal.empty())
-        wm.terminal = terminal;
-    InputRouter input(*backend, desktop, server.seat(), wm,
-                      {.quit = quit, .spawn = [&server](const std::string& cmd) {
-                           // A launch token lets the app take focus once it shows up, however slowly.
-                           const auto token = server.activation().createCompositorToken();
-                           process::spawn(cmd, {"XDG_ACTIVATION_TOKEN=" + token, "DESKTOP_STARTUP_ID=" + token});
-                       }});
+    InputRouter input(*backend, desktop, server.seat(), config);
     auto reap = loop.addSignal(SIGCHLD, [] { process::reapChildren(); });
     cursorOverlay = [&]() -> std::optional<Desktop::RenderItem> {
         Surface* surface = server.seat().cursorSurface();
@@ -263,6 +306,12 @@ int main()
     for (const auto& output : backend->outputs())
         log::info("core", "{}: {} frames presented", output->name(), output->framesPresented());
     gpu->renderer().waitIdle();
+    // Disconnect every client while everything that tracks their objects
+    // (desktop, Xwayland shell, textures) is still alive.
+    xwm.reset();
+    wl_display_destroy_clients(display.get());
+    desktop.setStyleResolver(nullptr); // the config goes before the desktop
+    desktop.setLayerStyleResolver(nullptr);
     backend.reset(); // outputs go first, while the server can still drop their globals
     renderers.clear();
     textures.reset();

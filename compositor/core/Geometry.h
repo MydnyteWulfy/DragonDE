@@ -43,6 +43,17 @@ struct Rect {
     constexpr Point position() const { return {x, y}; }
     constexpr Size size() const { return {width, height}; }
     constexpr bool contains(Point p) const { return p.x >= x && p.y >= y && p.x < x + width && p.y < y + height; }
+    constexpr bool contains(PointF p) const { return p.x >= x && p.y >= y && p.x < x + width && p.y < y + height; }
+
+    // Grown by `d` on every side (shrunk if negative).
+    constexpr Rect adjusted(std::int32_t d) const { return {x - d, y - d, width + 2 * d, height + 2 * d}; }
+    constexpr Rect intersected(Rect o) const
+    {
+        const std::int32_t x0 = x > o.x ? x : o.x, y0 = y > o.y ? y : o.y;
+        const std::int32_t x1 = x + width < o.x + o.width ? x + width : o.x + o.width;
+        const std::int32_t y1 = y + height < o.y + o.height ? y + height : o.y + o.height;
+        return x1 > x0 && y1 > y0 ? Rect{x0, y0, x1 - x0, y1 - y0} : Rect{};
+    }
 };
 
 } // namespace dragon

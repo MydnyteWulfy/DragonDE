@@ -42,6 +42,9 @@ enum Xwm::Atom : int {
     NET_WM_CM_S0,
     NET_CLIENT_LIST,
     NET_WM_WINDOW_TYPE,
+    NET_WM_WINDOW_TYPE_SPLASH,
+    NET_FRAME_EXTENTS,
+    MOTIF_WM_HINTS,
     WL_SURFACE_SERIAL,
     AtomCount,
 };
@@ -74,12 +77,16 @@ constexpr std::array<const char*, Xwm::AtomCount> kAtomNames = {
     "_NET_WM_CM_S0",
     "_NET_CLIENT_LIST",
     "_NET_WM_WINDOW_TYPE",
+    "_NET_WM_WINDOW_TYPE_SPLASH",
+    "_NET_FRAME_EXTENTS",
+    "_MOTIF_WM_HINTS",
     "WL_SURFACE_SERIAL",
 };
 
 // ICCCM WM_STATE values.
 constexpr std::uint32_t kWithdrawnState = 0;
 constexpr std::uint32_t kNormalState = 1;
+constexpr std::uint32_t kIconicState = 3;
 
 // _NET_WM_MOVERESIZE directions -> xdg_toplevel resize edges.
 constexpr std::uint32_t kMoveResizeMove = 8;
@@ -162,6 +169,9 @@ public:
         writeNetWmState();
     }
     void setResizing(bool) override {}
+    bool canServerDecorate() const override { return m_wantsDecorations && !m_splash; }
+    void setServerDecorated(bool) override {} // X clients never draw frames unless they opt out
+    void setMinimized(bool on) override { setWmState(on ? kIconicState : kNormalState); }
     void setBounds(Size) override {}
 
     void close() override
@@ -291,6 +301,8 @@ public:
     bool m_maximized = false;
     bool m_fullscreen = false;
     bool m_desktopMapped = false;
+    bool m_wantsDecorations = true; // _MOTIF_WM_HINTS may say no (Chrome, Steam, games)
+    bool m_splash = false;
 
 private:
     Surface* m_surface = nullptr;
@@ -599,6 +611,9 @@ void Xwm::onClientMessage(const void* event)
             w->fullscreenRequested.emit(apply(w->fullscreen()));
         if (maximizeTouched)
             w->maximizeRequested.emit(apply(w->maximized()));
+    } else if (e->type == a[WM_CHANGE_STATE]) {
+        if (e->data.data32[0] == kIconicState) // ICCCM: the client asks to be iconified
+            w->minimizeRequested.emit();
     } else if (e->type == a[NET_ACTIVE_WINDOW]) {
         // Honored when an X window already has focus (the app moving it between its
         // own windows) or a pager asks (source 2); otherwise it's focus stealing.
@@ -646,7 +661,8 @@ void Xwm::readProperties(XwaylandWindow& w)
 {
     for (xcb_atom_t atom : {xcb_atom_t(XCB_ATOM_WM_NAME), m_atoms->values[NET_WM_NAME], xcb_atom_t(XCB_ATOM_WM_CLASS),
                             xcb_atom_t(XCB_ATOM_WM_HINTS), xcb_atom_t(XCB_ATOM_WM_NORMAL_HINTS),
-                            m_atoms->values[WM_PROTOCOLS], m_atoms->values[NET_WM_STATE]})
+                            m_atoms->values[WM_PROTOCOLS], m_atoms->values[NET_WM_STATE],
+                            m_atoms->values[MOTIF_WM_HINTS], m_atoms->values[NET_WM_WINDOW_TYPE]})
         readProperty(w, atom);
 }
 
@@ -661,6 +677,7 @@ void Xwm::readProperty(XwaylandWindow& w, std::uint32_t atom)
             if (r && r->value_len > 0) {
                 w.m_title.assign(static_cast<const char*>(xcb_get_property_value(r.get())),
                                  std::size_t(xcb_get_property_value_length(r.get())));
+                w.titleChanged.emit();
                 return;
             }
         }
@@ -669,6 +686,7 @@ void Xwm::readProperty(XwaylandWindow& w, std::uint32_t atom)
         if (xcb_icccm_get_wm_class_reply(m_conn, xcb_icccm_get_wm_class(m_conn, w.id), &cls, nullptr)) {
             w.m_appId = cls.class_name ? cls.class_name : "";
             xcb_icccm_get_wm_class_reply_wipe(&cls);
+            w.appIdChanged.emit();
         }
     } else if (atom == XCB_ATOM_WM_HINTS) {
         xcb_icccm_wm_hints_t hints;
@@ -692,6 +710,33 @@ void Xwm::readProperty(XwaylandWindow& w, std::uint32_t atom)
             w.m_deleteWindow = std::find(begin, end, a[WM_DELETE_WINDOW]) != end;
             w.m_takeFocus = std::find(begin, end, a[WM_TAKE_FOCUS]) != end;
             xcb_icccm_get_wm_protocols_reply_wipe(&protocols);
+        }
+    } else if (atom == a[MOTIF_WM_HINTS]) {
+        // flags, functions, decorations, input mode, status: decorations
+        // counts when flags has bit 1; 0 means "no frame at all".
+        Reply<xcb_get_property_reply_t> r(xcb_get_property_reply(
+            m_conn, xcb_get_property(m_conn, 0, w.id, a[MOTIF_WM_HINTS], XCB_GET_PROPERTY_TYPE_ANY, 0, 5), nullptr));
+        bool wants = true;
+        if (r && r->format == 32 && xcb_get_property_value_length(r.get()) >= 3 * 4) {
+            const auto* hints = static_cast<const std::uint32_t*>(xcb_get_property_value(r.get()));
+            wants = !(hints[0] & 2) || hints[2] != 0;
+        }
+        if (wants != w.m_wantsDecorations) {
+            w.m_wantsDecorations = wants;
+            w.decorationChanged.emit();
+        }
+    } else if (atom == a[NET_WM_WINDOW_TYPE]) {
+        Reply<xcb_get_property_reply_t> r(xcb_get_property_reply(
+            m_conn, xcb_get_property(m_conn, 0, w.id, a[NET_WM_WINDOW_TYPE], XCB_ATOM_ATOM, 0, 32), nullptr));
+        bool splash = false;
+        if (r) {
+            const auto* atoms = static_cast<const xcb_atom_t*>(xcb_get_property_value(r.get()));
+            const int count = xcb_get_property_value_length(r.get()) / int(sizeof(xcb_atom_t));
+            splash = std::find(atoms, atoms + count, a[NET_WM_WINDOW_TYPE_SPLASH]) != atoms + count;
+        }
+        if (splash != w.m_splash) {
+            w.m_splash = splash;
+            w.decorationChanged.emit();
         }
     } else if (atom == a[NET_WM_STATE]) {
         // Initial state set before mapping (e.g. games starting fullscreen).

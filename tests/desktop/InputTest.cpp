@@ -3,9 +3,11 @@
 
 #include "../server/ServerFixture.h"
 
+#include "config/Config.h"
 #include "desktop/Desktop.h"
 #include "desktop/InputRouter.h"
 #include "desktop/Toplevel.h"
+#include "protocols/LayerShell.h"
 #include "protocols/Seat.h"
 #include "protocols/XdgShell.h"
 
@@ -14,6 +16,12 @@
 #include "cursor-shape-v1-client-protocol.h"
 #include "primary-selection-unstable-v1-client-protocol.h"
 #include "xdg-activation-v1-client-protocol.h"
+#include "xdg-decoration-unstable-v1-client-protocol.h"
+// wayland-scanner keeps the argument name `namespace`, a C++ keyword.
+#include <wayland-client.h>
+#define namespace namespace_
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#undef namespace
 
 #include <fcntl.h>
 #include <linux/input-event-codes.h>
@@ -50,11 +58,14 @@ class InputTest : public test::ServerFixture {
 protected:
     TestBackend backend;
     std::unique_ptr<Desktop> desktop;
+    std::unique_ptr<Config> config;
     std::unique_ptr<InputRouter> router;
     wl_seat* seat = nullptr;
     wl_pointer* pointer = nullptr;
     wl_keyboard* keyboard = nullptr;
     wl_data_device_manager* ddm = nullptr;
+    zxdg_decoration_manager_v1* decorationManager = nullptr;
+    zwlr_layer_shell_v1* layerShell = nullptr;
     ClientInput in;
     int quits = 0;
     std::vector<std::string> spawned;
@@ -64,11 +75,12 @@ protected:
         ServerFixture::SetUp();
         desktop = std::make_unique<Desktop>(*server);
         desktop->setArea({0, 0, 800, 600});
-        router = std::make_unique<InputRouter>(
-            backend, *desktop, server->seat(),
-            WindowManagerConfig{.modifier = "Mod1", .modifierLabel = "Alt", .terminal = "test-terminal"},
-            WindowManagerActions{.quit = [this] { ++quits; },
-                                 .spawn = [this](const std::string& cmd) { spawned.push_back(cmd); }});
+        ConfigActions actions{.spawn = [this](const std::string& cmd) { spawned.push_back(cmd); },
+                              .quit = [this] { ++quits; }};
+        addWindowActions(actions, *desktop);
+        config = std::make_unique<Config>(std::move(actions));
+        ASSERT_TRUE(config->loadString(R"(dragon.set{ modifier = "alt", terminal = "test-terminal" })"));
+        router = std::make_unique<InputRouter>(backend, *desktop, server->seat(), *config);
 
         static const wl_registry_listener listener = {
             .global =
@@ -77,6 +89,12 @@ protected:
                     const std::string_view i(iface);
                     if (i == "wl_seat")
                         self->seat = self->track(static_cast<wl_seat*>(wl_registry_bind(reg, name, &wl_seat_interface, 8)));
+                    else if (i == "zwlr_layer_shell_v1")
+                        self->layerShell = self->track(static_cast<zwlr_layer_shell_v1*>(
+                            wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 4)));
+                    else if (i == "zxdg_decoration_manager_v1")
+                        self->decorationManager = self->track(static_cast<zxdg_decoration_manager_v1*>(
+                            wl_registry_bind(reg, name, &zxdg_decoration_manager_v1_interface, 1)));
                     else if (i == "wl_data_device_manager")
                         self->ddm = self->track(static_cast<wl_data_device_manager*>(
                             wl_registry_bind(reg, name, &wl_data_device_manager_interface, 3)));
@@ -101,6 +119,7 @@ protected:
         if (client)
             disconnect();
         router.reset();
+        config.reset();
         desktop.reset();
         ServerFixture::TearDown();
     }
@@ -113,6 +132,104 @@ protected:
         mapWindow(*win, w, h);
         EXPECT_TRUE(roundtrip());
         return win;
+    }
+
+    // Window styles from a config snippet (the compositor's main does the same).
+    void useStyles(const std::string& lua)
+    {
+        ASSERT_TRUE(config->loadString(R"(dragon.set{ modifier = "alt", terminal = "test-terminal" })" + lua))
+            << config->lastError();
+        desktop->setStyleResolver(
+            [this](const Toplevel& t) { return config->styleFor(t.appId(), t.title()); });
+    }
+
+    // A window that speaks xdg-decoration; `mode` follows what we tell it.
+    struct DecoratedWindow {
+        std::unique_ptr<test::ClientWindow> window;
+        zxdg_toplevel_decoration_v1* decoration = nullptr;
+        std::uint32_t mode = 0;
+    };
+    std::unique_ptr<DecoratedWindow> decoratedWindow(std::int32_t w, std::int32_t h, const char* appId = nullptr)
+    {
+        auto d = std::make_unique<DecoratedWindow>();
+        d->window = makeWindow();
+        if (appId)
+            xdg_toplevel_set_app_id(d->window->toplevel, appId);
+        d->decoration = track(zxdg_decoration_manager_v1_get_toplevel_decoration(decorationManager, d->window->toplevel));
+        static const zxdg_toplevel_decoration_v1_listener listener = {
+            .configure = [](void* data, zxdg_toplevel_decoration_v1*, std::uint32_t mode) {
+                static_cast<DecoratedWindow*>(data)->mode = mode;
+            },
+        };
+        zxdg_toplevel_decoration_v1_add_listener(d->decoration, &listener, d.get());
+        EXPECT_TRUE(roundtrip());
+        mapWindow(*d->window, w, h);
+        EXPECT_TRUE(roundtrip());
+        return d;
+    }
+
+    // A layer-shell client surface; `width`/`height` follow our configures.
+    struct ClientLayer {
+        wl_surface* surface = nullptr;
+        zwlr_layer_surface_v1* layer = nullptr;
+        std::uint32_t serial = 0;
+        std::uint32_t width = 0, height = 0;
+        bool closed = false;
+        LayerSurface* server = nullptr;
+    };
+    struct LayerSpec {
+        std::uint32_t layer = ZWLR_LAYER_SHELL_V1_LAYER_TOP;
+        std::uint32_t anchor = 0;
+        std::uint32_t width = 0, height = 0;
+        std::int32_t exclusiveZone = 0;
+        std::uint32_t keyboard = ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE;
+    };
+    std::unique_ptr<ClientLayer> layer(const LayerSpec& spec, bool map = true)
+    {
+        auto l = std::make_unique<ClientLayer>();
+        l->surface = makeSurface();
+        EXPECT_TRUE(roundtrip());
+        Surface* serverSurface = surfaces.back();
+        l->layer = track(zwlr_layer_shell_v1_get_layer_surface(layerShell, l->surface, nullptr, spec.layer, "test"));
+        static const zwlr_layer_surface_v1_listener listener = {
+            .configure = [](void* d, zwlr_layer_surface_v1*, std::uint32_t serial, std::uint32_t w, std::uint32_t h) {
+                auto* self = static_cast<ClientLayer*>(d);
+                self->serial = serial;
+                self->width = w;
+                self->height = h;
+            },
+            .closed = [](void* d, zwlr_layer_surface_v1*) { static_cast<ClientLayer*>(d)->closed = true; },
+        };
+        zwlr_layer_surface_v1_add_listener(l->layer, &listener, l.get());
+        zwlr_layer_surface_v1_set_size(l->layer, spec.width, spec.height);
+        zwlr_layer_surface_v1_set_anchor(l->layer, spec.anchor);
+        zwlr_layer_surface_v1_set_exclusive_zone(l->layer, spec.exclusiveZone);
+        zwlr_layer_surface_v1_set_keyboard_interactivity(l->layer, spec.keyboard);
+        wl_surface_commit(l->surface);
+        EXPECT_TRUE(roundtrip());
+        l->server = LayerSurface::from(serverSurface);
+        if (map)
+            mapLayer(*l);
+        return l;
+    }
+    void mapLayer(ClientLayer& l)
+    {
+        zwlr_layer_surface_v1_ack_configure(l.layer, l.serial);
+        wl_surface_attach(l.surface, makeBuffer(std::int32_t(l.width), std::int32_t(l.height)), 0, 0);
+        wl_surface_damage_buffer(l.surface, 0, 0, std::int32_t(l.width), std::int32_t(l.height));
+        wl_surface_commit(l.surface);
+        EXPECT_TRUE(roundtrip());
+    }
+
+    void clickAt(double x, double y, std::uint32_t timeMs, std::uint32_t button = BTN_LEFT)
+    {
+        backend.input.pointerMotionAbsolute.emit(nullptr, x, y, timeMs);
+        backend.input.pointerFrame.emit();
+        backend.input.pointerButton.emit(button, true, timeMs);
+        backend.input.pointerFrame.emit();
+        backend.input.pointerButton.emit(button, false, timeMs + 50);
+        backend.input.pointerFrame.emit();
+        ASSERT_TRUE(roundtrip());
     }
 
     void move(double x, double y)
@@ -521,6 +638,101 @@ TEST_F(InputTest, ShortcutsRunAndAreHiddenFromClients)
         EXPECT_FALSE(in.saw(std::format("key {} 0", k))) << k;
     }
     EXPECT_TRUE(in.saw(std::format("key {} 1", KEY_LEFTALT))) << "plain modifiers still reach the client";
+}
+
+TEST_F(InputTest, ConfigShortcutsCallLuaAndMatchTheUnshiftedKey)
+{
+    ASSERT_TRUE(config->loadString(R"(
+        dragon.set{ modifier = "alt", terminal = "test-terminal" }
+        dragon.bind("Mod+Shift+2", function() dragon.spawn("two") end)
+        dragon.bind("Ctrl+Alt+t", "terminal")
+        dragon.unbind("Mod+Return")
+    )"));
+    auto w = window(100, 100);
+    in.log.clear();
+
+    key(KEY_LEFTALT, true);
+    key(KEY_LEFTSHIFT, true);
+    key(KEY_2, true); // "@" with Shift: still bound as "2"
+    key(KEY_2, false);
+    key(KEY_LEFTSHIFT, false);
+    key(KEY_ENTER, true); // unbound now: goes to the client
+    key(KEY_ENTER, false);
+    key(KEY_LEFTCTRL, true);
+    key(KEY_T, true);
+    key(KEY_T, false);
+    key(KEY_LEFTCTRL, false);
+    key(KEY_LEFTALT, false);
+    ASSERT_TRUE(roundtrip());
+
+    EXPECT_EQ(spawned, (std::vector<std::string>{"two", "test-terminal"}));
+    EXPECT_TRUE(in.saw(std::format("key {} 1", KEY_ENTER)));
+    EXPECT_FALSE(in.saw(std::format("key {} 1", KEY_2)));
+    EXPECT_FALSE(in.saw(std::format("key {} 1", KEY_T)));
+}
+
+TEST_F(InputTest, ShortcutModifiersMustMatchExactly)
+{
+    auto w = window(100, 100);
+    key(KEY_LEFTALT, true);
+    key(KEY_LEFTCTRL, true);
+    key(KEY_ENTER, true); // Ctrl+Alt+Enter is not Alt+Enter
+    key(KEY_ENTER, false);
+    key(KEY_LEFTCTRL, false);
+    key(KEY_LEFTALT, false);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_TRUE(spawned.empty());
+}
+
+TEST_F(InputTest, MinimizeHidesAndRestoreBringsBack)
+{
+    auto a = window(100, 100);
+    auto b = window(100, 100); // focused, on top
+    ASSERT_EQ(desktop->windows().size(), 2u);
+    Desktop::Window* top = desktop->windows().back().get();
+    Desktop::Window* below = desktop->windows().front().get();
+
+    key(KEY_LEFTALT, true);
+    key(KEY_M, true);
+    key(KEY_M, false);
+    key(KEY_LEFTALT, false);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_TRUE(top->minimized());
+    EXPECT_EQ(desktop->focusedWindow(), below);
+    for (const auto& item : desktop->renderList())
+        EXPECT_NE(item.surface, top->toplevel->surface()) << "minimized windows aren't drawn";
+
+    // A client can minimize itself too.
+    xdg_toplevel_set_minimized(a->toplevel);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_TRUE(below->minimized());
+    EXPECT_EQ(desktop->focusedWindow(), nullptr);
+
+    // Mod+Shift+M: most recently minimized first.
+    key(KEY_LEFTALT, true);
+    key(KEY_LEFTSHIFT, true);
+    key(KEY_M, true);
+    key(KEY_M, false);
+    key(KEY_LEFTSHIFT, false);
+    key(KEY_LEFTALT, false);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_FALSE(below->minimized());
+    EXPECT_TRUE(top->minimized());
+    EXPECT_EQ(desktop->focusedWindow(), below);
+}
+
+TEST_F(InputTest, KeyboardSettingsReachClients)
+{
+    ASSERT_TRUE(config->loadString(R"(dragon.set{ keyboard = { repeat_rate = 40, repeat_delay = 250 } })"));
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(in.repeatRate, 40);
+    EXPECT_EQ(in.repeatDelay, 250);
+
+    const auto before = in.keymap;
+    ASSERT_TRUE(config->loadString(R"(dragon.set{ keyboard = { layout = "de" } })"));
+    ASSERT_TRUE(roundtrip());
+    EXPECT_NE(in.keymap, before);
+    EXPECT_NE(in.keymap.find("de"), std::string::npos);
 }
 
 TEST_F(InputTest, MaximizeFillsTheAreaAndRestores)
@@ -1106,4 +1318,247 @@ TEST_F(DragTest, DragIconFollowsThePointer)
     EXPECT_EQ(server->seat().dragIcon(), nullptr);
     if (log.offer)
         wl_data_offer_destroy(log.offer);
+}
+
+// ------------------------------------------------------------ decorations --
+// Styles below: 30px title bar, 2px border, buttons [min][max][close] on the
+// right (18px, 6 apart, 8 from the edge). A 200x100 window in 800x600 sits at
+// (300,265); its title bar spans (300,235)-(500,265); button centers are at
+// x = 435 / 459 / 483, y = 250.
+namespace {
+const std::string kStyles = R"(
+    dragon.set{ windows = { corner_radius = 8, border = { width = 2 }, titlebar = { height = 30 } } }
+)";
+} // namespace
+
+TEST_F(InputTest, WindowsThatAskGetOurTitleBar)
+{
+    useStyles(kStyles + R"(dragon.rule({ app_id = "csd-app" }, { titlebar = { enabled = false } }))");
+    auto ours = decoratedWindow(200, 100);
+    EXPECT_EQ(ours->mode, std::uint32_t(ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE));
+    Desktop::Window* w = desktop->windows().back().get();
+    EXPECT_TRUE(w->titlebar);
+    EXPECT_EQ(w->position, (Point{300, 265})) << "the frame is centered, not just the window";
+    EXPECT_EQ(desktop->frameOf(*w).titlebar, (Rect{300, 235, 200, 30}));
+
+    // A rule can leave the title bar to the app.
+    auto theirs = decoratedWindow(200, 100, "csd-app");
+    EXPECT_EQ(theirs->mode, std::uint32_t(ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE));
+    EXPECT_FALSE(desktop->windows().back()->titlebar);
+
+    // Apps without xdg-decoration (GTK) always draw their own.
+    auto gtk = window(200, 100);
+    EXPECT_FALSE(desktop->windows().back()->titlebar);
+    EXPECT_TRUE(desktop->frameOf(*desktop->windows().back()).styled) << "but still get our corners and border";
+
+    // Turning title bars off in the config tells the client right away.
+    useStyles(R"(dragon.set{ windows = { titlebar = { enabled = false } } })");
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(ours->mode, std::uint32_t(ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE));
+}
+
+TEST_F(InputTest, TitleBarButtons)
+{
+    useStyles(kStyles);
+    auto d = decoratedWindow(200, 100);
+    Desktop::Window* w = desktop->windows().back().get();
+
+    move(483, 250);
+    EXPECT_EQ(w->hoveredButton, 2);
+    EXPECT_EQ(server->seat().pointerFocus(), nullptr) << "the title bar is ours, not the client's";
+
+    clickAt(459, 250, 1000); // maximize
+    EXPECT_TRUE(d->window->hasState(XDG_TOPLEVEL_STATE_MAXIMIZED));
+    EXPECT_EQ(d->window->width, 800);
+    EXPECT_EQ(d->window->height, 570) << "maximized leaves room for the title bar";
+    EXPECT_EQ(w->position, (Point{0, 30}));
+    mapWindow(*d->window, 800, 570);
+    ASSERT_TRUE(roundtrip());
+
+    // Maximized: buttons are now at the right edge of the screen.
+    clickAt(800 - 8 - 18 - 6 - 9, 15, 2000); // maximize again: restore
+    EXPECT_FALSE(d->window->hasState(XDG_TOPLEVEL_STATE_MAXIMIZED));
+    mapWindow(*d->window, 200, 100);
+    ASSERT_TRUE(roundtrip());
+
+    clickAt(435, 250, 3000); // minimize
+    EXPECT_TRUE(w->minimized());
+    desktop->unminimize(*w);
+
+    // Pressing a button and sliding off it does nothing.
+    move(483, 250);
+    backend.input.pointerButton.emit(BTN_LEFT, true, 4000);
+    move(400, 250);
+    backend.input.pointerButton.emit(BTN_LEFT, false, 4050);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_FALSE(d->window->closed);
+
+    clickAt(483, 250, 5000); // close
+    EXPECT_TRUE(d->window->closed);
+}
+
+TEST_F(InputTest, DraggingTheTitleBarMovesAndDoubleClickMaximizes)
+{
+    useStyles(kStyles);
+    auto d = decoratedWindow(200, 100);
+    Desktop::Window* w = desktop->windows().back().get();
+
+    clickAt(350, 250, 1000); // a click alone moves nothing
+    EXPECT_EQ(w->position, (Point{300, 265}));
+
+    move(350, 250);
+    backend.input.pointerButton.emit(BTN_LEFT, true, 3000);
+    move(352, 251); // under the drag threshold
+    EXPECT_EQ(w->position, (Point{300, 265}));
+    move(400, 300);
+    backend.input.pointerButton.emit(BTN_LEFT, false, 3100);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(w->position, (Point{350, 315}));
+    EXPECT_FALSE(in.saw(std::format("button {} 1", BTN_LEFT))) << "the client never sees title bar clicks";
+
+    clickAt(400, 300, 5000);
+    clickAt(400, 300, 5200); // double click
+    EXPECT_TRUE(d->window->hasState(XDG_TOPLEVEL_STATE_MAXIMIZED));
+}
+
+TEST_F(InputTest, FrameEdgesResize)
+{
+    useStyles(kStyles);
+    auto d = decoratedWindow(200, 100);
+
+    // Just outside the right border (border 2 + grab margin).
+    move(504, 300);
+    EXPECT_EQ(server->seat().pointerFocus(), nullptr);
+    backend.input.pointerButton.emit(BTN_LEFT, true, 1000);
+    move(554, 300);
+    EXPECT_EQ(d->window->width, 250);
+    EXPECT_EQ(d->window->height, 100);
+    backend.input.pointerButton.emit(BTN_LEFT, false, 1100);
+    ASSERT_TRUE(roundtrip());
+
+    // Bottom-left corner: both edges.
+    const auto deco = desktop->decorationAt({297, 367});
+    EXPECT_EQ(deco.part, Desktop::DecorationHit::Part::Edge);
+    EXPECT_EQ(deco.edges, std::uint32_t(XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT));
+}
+
+TEST_F(InputTest, StyledWindowsAreCutToTheirGeometry)
+{
+    useStyles(kStyles);
+    // A client-side-decorated window: 20px of shadow around a 160x60 window.
+    auto w = makeWindow();
+    xdg_surface_set_window_geometry(w->xdg, 20, 20, 160, 60);
+    ASSERT_TRUE(roundtrip());
+    mapWindow(*w, 200, 100);
+    ASSERT_TRUE(roundtrip());
+    const Rect g = desktop->geometryOf(*desktop->windows().back());
+
+    EXPECT_TRUE(desktop->surfaceAt({g.x + 5.0, g.y + 5.0}).surface);
+    EXPECT_FALSE(desktop->surfaceAt({g.x - 5.0, g.y + 30.0}).surface) << "the client's shadow isn't hit";
+    EXPECT_EQ(desktop->decorationAt({g.x - 5.0, g.y + 30.0}).edges, std::uint32_t(XDG_TOPLEVEL_RESIZE_EDGE_LEFT))
+        << "our frame resizes it instead";
+
+    // Unstyled windows keep the client's input margins.
+    desktop->setStyleResolver(nullptr);
+    EXPECT_TRUE(desktop->surfaceAt({g.x - 5.0, g.y + 30.0}).surface);
+}
+
+// ------------------------------------------------------------ layer shell --
+
+TEST_F(InputTest, BarsReserveTheirEdgeOfTheScreen)
+{
+    ASSERT_TRUE(layerShell);
+    auto bar = layer({.anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                                ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
+                      .height = 30,
+                      .exclusiveZone = 30});
+    EXPECT_EQ(bar->width, 800u) << "stretched between the left and right edges";
+    EXPECT_EQ(bar->height, 30u);
+    EXPECT_EQ(desktop->layerPosition(bar->server), (Point{0, 0}));
+    EXPECT_EQ(desktop->area(), (Rect{0, 30, 800, 570})) << "windows get the rest";
+
+    auto w = window(100, 100);
+    EXPECT_EQ(desktop->windows().back()->position, (Point{350, 265})) << "centered in what's left";
+    xdg_toplevel_set_maximized(w->toplevel);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(w->height, 570);
+    EXPECT_EQ(desktop->windows().back()->position, (Point{0, 30}));
+
+    // Fullscreen ignores bars, and covers them.
+    xdg_toplevel_set_fullscreen(w->toplevel, nullptr);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(w->height, 600);
+    mapWindow(*w, 800, 600);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_NE(desktop->surfaceAt({400, 10}).surface, bar->server->surface());
+
+    // The bar going away frees its strip.
+    wl_surface_attach(bar->surface, nullptr, 0, 0);
+    wl_surface_commit(bar->surface);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(desktop->area(), (Rect{0, 0, 800, 600}));
+}
+
+TEST_F(InputTest, LaunchersAreCenteredOnTopAndTakeTheKeyboard)
+{
+    auto w = window(100, 100);
+    auto launcher = layer({.width = 300, .height = 200,
+                           .keyboard = ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE});
+    EXPECT_EQ(launcher->width, 300u);
+    EXPECT_EQ(desktop->layerPosition(launcher->server), (Point{250, 200})) << "no anchors: centered";
+    EXPECT_EQ(desktop->surfaceAt({400, 300}).surface, launcher->server->surface()) << "above the window";
+    EXPECT_EQ(server->seat().keyboardFocus(), launcher->server->surface());
+
+    // Clicking a window doesn't take the keyboard from an exclusive surface.
+    clickAt(260, 260, 1000);
+    EXPECT_EQ(server->seat().keyboardFocus(), launcher->server->surface());
+
+    // Closing it hands the keyboard back.
+    forget(launcher->layer);
+    forget(launcher->surface);
+    zwlr_layer_surface_v1_destroy(launcher->layer);
+    wl_surface_destroy(launcher->surface);
+    ASSERT_TRUE(roundtrip());
+    EXPECT_EQ(server->seat().keyboardFocus(), desktop->windows().back()->toplevel->surface());
+}
+
+TEST_F(InputTest, OnDemandLayersFocusOnClick)
+{
+    auto w = window(100, 100);
+    auto panel = layer({.anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM, .width = 200, .height = 40,
+                        .keyboard = ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND});
+    EXPECT_EQ(desktop->layerPosition(panel->server), (Point{300, 560}));
+    EXPECT_NE(server->seat().keyboardFocus(), panel->server->surface()) << "not until it's clicked";
+
+    clickAt(400, 580, 1000);
+    EXPECT_EQ(server->seat().keyboardFocus(), panel->server->surface());
+    clickAt(400, 300, 2000); // the window
+    EXPECT_EQ(server->seat().keyboardFocus(), desktop->windows().back()->toplevel->surface());
+}
+
+TEST_F(InputTest, LayersStackAroundWindows)
+{
+    auto wallpaper = layer({.layer = ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND,
+                            .anchor = 15, // all edges
+                            .exclusiveZone = -1});
+    EXPECT_EQ(wallpaper->width, 800u);
+    EXPECT_EQ(wallpaper->height, 600u);
+    auto w = window(100, 100);
+    EXPECT_NE(desktop->surfaceAt({400, 300}).surface, wallpaper->server->surface()) << "windows are above it";
+    EXPECT_EQ(desktop->surfaceAt({10, 10}).surface, wallpaper->server->surface());
+
+    auto overlay = layer({.layer = ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, .width = 50, .height = 50});
+    EXPECT_EQ(desktop->surfaceAt({400, 300}).surface, overlay->server->surface());
+}
+
+TEST_F(InputTest, LayerSurfaceMistakesAreProtocolErrors)
+{
+    // Size 0 without anchors on both sides.
+    auto bad = makeSurface();
+    auto* l = track(zwlr_layer_shell_v1_get_layer_surface(layerShell, bad, nullptr, ZWLR_LAYER_SHELL_V1_LAYER_TOP, "bad"));
+    zwlr_layer_surface_v1_set_anchor(l, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP);
+    wl_surface_commit(bad);
+    EXPECT_FALSE(roundtrip());
+    EXPECT_EQ(wl_display_get_error(client), EPROTO);
+    (void)l;
 }

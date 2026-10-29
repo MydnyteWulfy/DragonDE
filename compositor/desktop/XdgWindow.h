@@ -32,6 +32,8 @@ public:
     void setResizing(bool on) override;
     void setBounds(Size bounds) override;
     void close() override;
+    bool canServerDecorate() const override;
+    void setServerDecorated(bool on) override;
 
 private:
     XdgToplevel& m_toplevel;

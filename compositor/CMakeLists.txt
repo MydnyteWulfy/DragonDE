@@ -1,5 +1,6 @@
 add_library(dragon_core STATIC
     core/EventLoop.cpp
+    core/FileWatcher.cpp
     core/Log.cpp
     core/Png.cpp
     core/Process.cpp
@@ -35,6 +36,11 @@ dragon_add_protocol(dragon_wayland
 dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/staging/xdg-activation/xdg-activation-v1.xml)
 dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/staging/cursor-shape/cursor-shape-v1.xml)
 dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/staging/xwayland-shell/xwayland-shell-v1.xml)
+dragon_add_protocol(dragon_wayland
+    ${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml)
+dragon_add_protocol(dragon_wayland ${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-output/xdg-output-unstable-v1.xml)
+# Not in wayland-protocols: vendored from wlr-protocols.
+dragon_add_protocol(dragon_wayland ${PROJECT_SOURCE_DIR}/protocols/wlr/wlr-layer-shell-unstable-v1.xml)
 
 # GPU: render node, GBM allocation, dma-buf sync, swapchains, Vulkan renderer.
 find_package(Vulkan REQUIRED)
@@ -79,6 +85,9 @@ dragon_add_client_protocol(dragon_client_protocols ${WAYLAND_PROTOCOLS_DIR}/stab
 dragon_add_client_protocol(dragon_client_protocols
     ${WAYLAND_PROTOCOLS_DIR}/unstable/primary-selection/primary-selection-unstable-v1.xml)
 dragon_add_client_protocol(dragon_client_protocols ${WAYLAND_PROTOCOLS_DIR}/staging/xdg-activation/xdg-activation-v1.xml)
+dragon_add_client_protocol(dragon_client_protocols ${PROJECT_SOURCE_DIR}/protocols/wlr/wlr-layer-shell-unstable-v1.xml)
+dragon_add_client_protocol(dragon_client_protocols
+    ${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-output/xdg-output-unstable-v1.xml)
 
 # Backends: where outputs and input come from.
 add_library(dragon_backend STATIC
@@ -98,10 +107,12 @@ add_library(dragon_server STATIC
     protocols/Compositor.cpp
     protocols/CursorShape.cpp
     protocols/DataDevice.cpp
+    protocols/LayerShell.cpp
     protocols/LinuxDmabuf.cpp
     protocols/Output.cpp
     protocols/Seat.cpp
     protocols/XdgActivation.cpp
+    protocols/XdgDecoration.cpp
     protocols/XdgShell.cpp
 )
 pkg_check_modules(XkbCommon REQUIRED IMPORTED_TARGET xkbcommon)
@@ -110,17 +121,34 @@ target_link_libraries(dragon_server
     PRIVATE PkgConfig::XkbCommon dragon::options
 )
 
+# User configuration: config.lua (settings and shortcuts).
+pkg_check_modules(Lua REQUIRED IMPORTED_TARGET lua54)
+
+add_library(dragon_config STATIC
+    config/Config.cpp
+    config/Settings.cpp
+)
+target_link_libraries(dragon_config
+    PUBLIC dragon_core PkgConfig::XkbCommon
+    PRIVATE PkgConfig::Lua dragon::options
+)
+
 # What's on screen: window placement, surface textures, per-output rendering.
 add_library(dragon_desktop STATIC
     desktop/Desktop.cpp
     desktop/InputRouter.cpp
     desktop/OutputRenderer.cpp
     desktop/SurfaceTextures.cpp
+    desktop/Titlebar.cpp
+    desktop/TitlebarLayout.cpp
+    desktop/Wallpaper.cpp
     desktop/XdgWindow.cpp
 )
+pkg_check_modules(PangoCairo REQUIRED IMPORTED_TARGET pangocairo)
+pkg_check_modules(GdkPixbuf REQUIRED IMPORTED_TARGET gdk-pixbuf-2.0)
 target_link_libraries(dragon_desktop
-    PUBLIC dragon_server dragon_render
-    PRIVATE dragon::options
+    PUBLIC dragon_server dragon_render dragon_config
+    PRIVATE PkgConfig::PangoCairo PkgConfig::GdkPixbuf dragon::options
 )
 
 # X11 apps: Xwayland process management and the X window manager.
@@ -136,5 +164,5 @@ target_link_libraries(dragon_xwayland
     PRIVATE PkgConfig::Xcb dragon::options
 )
 
-add_executable(dragon-compositor main.cpp)
+add_executable(dragon-compositor main.cpp core/LsanSuppressions.cpp)
 target_link_libraries(dragon-compositor PRIVATE dragon_xwayland dragon::options)

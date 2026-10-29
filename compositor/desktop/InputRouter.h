@@ -12,33 +12,26 @@
 namespace dragon {
 
 class Backend;
+class Config;
 class Seat;
 class Surface;
+struct ConfigActions;
 struct PointerAxisEvent;
 
-struct WindowManagerConfig {
-    // XKB modifier for compositor shortcuts: "Mod4" (Super), "Mod1" (Alt), "Control".
-    std::string modifier = "Mod4";
-    std::string modifierLabel = "Super"; // for logs
-    std::string terminal = "kitty";
-};
-
-struct WindowManagerActions {
-    std::function<void()> quit;
-    std::function<void(const std::string& command)> spawn;
-};
+// The window actions shortcuts run (close, minimize, maximize...) on the
+// focused window. Spawn, quit and reload are left for the caller.
+void addWindowActions(ConfigActions& actions, Desktop& desktop);
 
 // Turns a backend's raw input into seat events and window management:
 //  - finds the surface under the pointer; click to focus and raise
 //  - keeps pointer focus on the pressed surface while a button is held
 //    (the implicit grab, so drags continue outside the window)
-//  - compositor shortcuts: Mod+Enter terminal, Mod+Q close, Mod+Shift+Esc quit
+//  - compositor shortcuts, from the config (keyboard settings too)
 //  - interactive move/resize: Mod+drag, Mod+right-drag, or a client's own
 //    request (title bar drags); input is withheld from clients meanwhile
 class InputRouter {
 public:
-    InputRouter(Backend& backend, Desktop& desktop, Seat& seat, WindowManagerConfig config = {},
-                WindowManagerActions actions = {});
+    InputRouter(Backend& backend, Desktop& desktop, Seat& seat, Config& config);
     ~InputRouter();
     InputRouter(const InputRouter&) = delete;
     InputRouter& operator=(const InputRouter&) = delete;
@@ -63,8 +56,15 @@ private:
     void button(std::uint32_t button, bool pressed, std::uint32_t timeMs);
     void key(std::uint32_t key, bool pressed, std::uint32_t timeMs);
     bool runShortcut(std::uint32_t key);
+    bool modifierHeld() const; // the configured Mod
+    void applyKeyboardSettings();
     // Re-picks the surface under the pointer (after motion, release, stacking changes).
     void updatePointerFocus(std::uint32_t timeMs, bool sendMotion);
+
+    // Our window decorations: title bars, their buttons, the resize edges.
+    bool decorationPress(std::uint32_t button, std::uint32_t timeMs);
+    bool decorationRelease(std::uint32_t button);
+    void setHover(Desktop::Window* window, int button);
 
     void startGrab(GrabKind kind, Desktop::Window& window, std::uint32_t button, std::uint32_t edges);
     void updateGrab();
@@ -74,13 +74,31 @@ private:
 
     Desktop& m_desktop;
     Seat& m_seat;
-    WindowManagerConfig m_config;
-    WindowManagerActions m_actions;
+    Config& m_config;
+    std::string m_backendKeymap; // the parent's keymap (nested), used unless the config names one
+    std::string m_keymapSource;  // what the seat's keymap was last built from
 
     PointF m_pointer;
     bool m_pointerInside = false;
     std::uint32_t m_lastClientButton = 0;
     Grab m_grab;
+    // Title bar pressed: becomes a move once the pointer travels a little
+    // (a click alone mustn't un-maximize).
+    struct PendingMove {
+        Desktop::Window* window = nullptr;
+        std::uint32_t button = 0;
+        PointF start;
+    } m_pendingMove;
+    // Title bar button held: runs if released over the same button.
+    struct ButtonPress {
+        Desktop::Window* window = nullptr;
+        int index = -1;
+        std::string action;
+        std::uint32_t button = 0;
+    } m_buttonPress;
+    Desktop::Window* m_hoverWindow = nullptr;
+    Desktop::Window* m_lastTitleClick = nullptr; // double-click detection
+    std::uint32_t m_lastTitleClickTime = 0;
     std::set<std::uint32_t> m_swallowedKeys;    // shortcut keys: their releases aren't sent either
     std::set<std::uint32_t> m_swallowedButtons; // Mod+click presses: same for releases
     std::vector<Connection> m_connections;

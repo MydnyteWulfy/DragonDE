@@ -52,6 +52,12 @@ public:
     void translate(Point d) { pixman_region32_translate(&m_region, d.x, d.y); }
 
     bool contains(Point p) const { return pixman_region32_contains_point(raw(), p.x, p.y, nullptr); }
+    // All of `r` is inside.
+    bool covers(Rect r) const
+    {
+        pixman_box32_t box{r.x, r.y, r.x + r.width, r.y + r.height};
+        return pixman_region32_contains_rectangle(raw(), &box) == PIXMAN_REGION_IN;
+    }
 
     Rect extents() const
     {

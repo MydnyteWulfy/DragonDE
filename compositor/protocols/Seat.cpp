@@ -20,8 +20,6 @@ namespace dragon {
 namespace {
 
 constexpr std::uint32_t kSeatVersion = 9;
-constexpr std::int32_t kRepeatRate = 25;   // keys per second
-constexpr std::int32_t kRepeatDelay = 600; // ms
 constexpr const char* kCursorRole = "wl_pointer-cursor";
 
 class PointerResource final : public proto::WlPointer {
@@ -161,6 +159,35 @@ bool Seat::setKeymap(const std::string& text)
     return true;
 }
 
+bool Seat::setKeymapNames(const std::string& layout, const std::string& variant, const std::string& options,
+                          const std::string& model)
+{
+    auto orNull = [](const std::string& v) { return v.empty() ? nullptr : v.c_str(); };
+    const xkb_rule_names names{.rules = nullptr,
+                               .model = orNull(model),
+                               .layout = orNull(layout),
+                               .variant = orNull(variant),
+                               .options = orNull(options)};
+    xkb_keymap* keymap = xkb_keymap_new_from_names(m_xkbContext, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (!keymap) {
+        log::warn("input", "cannot compile keymap layout='{}' variant='{}' options='{}' model='{}'", layout,
+                  variant, options, model);
+        return false;
+    }
+    applyKeymap(keymap);
+    return true;
+}
+
+void Seat::setRepeatInfo(std::int32_t rate, std::int32_t delay)
+{
+    if (rate == m_repeatRate && delay == m_repeatDelay)
+        return;
+    m_repeatRate = rate;
+    m_repeatDelay = delay;
+    for (auto* kb : m_keyboards.objects)
+        kb->sendRepeatInfo(m_repeatRate, m_repeatDelay);
+}
+
 void Seat::applyKeymap(xkb_keymap* keymap)
 {
     xkb_state_unref(m_xkbState);
@@ -197,7 +224,7 @@ void Seat::addKeyboard(proto::WlKeyboard* kb)
 {
     m_keyboards.add(kb);
     sendKeymap(*kb);
-    kb->sendRepeatInfo(kRepeatRate, kRepeatDelay);
+    kb->sendRepeatInfo(m_repeatRate, m_repeatDelay);
     if (m_keyboardFocus && m_keyboardFocus->client() == kb->client())
         sendKeyboardEnter(*kb, nextSerial());
 }
@@ -281,6 +308,18 @@ void Seat::sendModifiers(wl_client* client, std::uint32_t serial)
 bool Seat::modifierActive(const char* name) const
 {
     return m_xkbState && xkb_state_mod_name_is_active(m_xkbState, name, XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+
+std::uint32_t Seat::baseKeysym(std::uint32_t key) const
+{
+    if (!m_xkbState)
+        return 0;
+    const xkb_keycode_t code = key + 8;
+    const xkb_layout_index_t layout = xkb_state_key_get_layout(m_xkbState, code);
+    const xkb_keysym_t* syms = nullptr;
+    if (xkb_keymap_key_get_syms_by_level(m_keymap, code, layout == XKB_LAYOUT_INVALID ? 0 : layout, 0, &syms) < 1)
+        return 0;
+    return xkb_keysym_to_lower(syms[0]);
 }
 
 void Seat::rememberInput(std::uint32_t serial, Surface* focus)

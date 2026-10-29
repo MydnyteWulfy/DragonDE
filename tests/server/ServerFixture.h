@@ -170,8 +170,9 @@ public:
         return {iface ? iface->name : "", code};
     }
 
-    // A width x height XRGB8888 buffer filled with `pixel`.
-    wl_buffer* makeBuffer(std::int32_t width, std::int32_t height, std::uint32_t pixel = 0xff336699)
+    // A width x height XRGB8888 (or `format`) buffer filled with `pixel`.
+    wl_buffer* makeBuffer(std::int32_t width, std::int32_t height, std::uint32_t pixel = 0xff336699,
+                          std::uint32_t format = WL_SHM_FORMAT_XRGB8888)
     {
         const std::int32_t stride = width * 4;
         const std::int32_t size = stride * height;
@@ -183,7 +184,7 @@ public:
         munmap(data, std::size_t(size));
 
         auto* pool = wl_shm_create_pool(shm, fd, size);
-        auto* buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_XRGB8888);
+        auto* buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
         wl_shm_pool_destroy(pool);
         close(fd);
         return track(buffer);

@@ -14,6 +14,7 @@
 struct wl_client;
 struct wl_display;
 struct wl_global;
+struct wl_resource;
 
 namespace dragon {
 
@@ -26,6 +27,7 @@ class OutputGlobal;
 class Seat;
 class Surface;
 class XdgActivation;
+class LayerShell;
 class XdgPopup;
 class XdgSurface;
 class XdgToplevel;
@@ -49,6 +51,8 @@ public:
     void addOutput(Output& output);
     void removeOutput(Output& output);
     OutputGlobal* outputGlobal(const Output& output) const;
+    // The output a client's wl_output resource stands for.
+    OutputGlobal* outputGlobalFor(wl_resource* wlOutput) const;
 
     // Hides `global` from clients for which `allowed` returns false (e.g.
     // xwayland_shell_v1 is only for Xwayland).
@@ -56,6 +60,7 @@ public:
 
     Seat& seat() const { return *m_seat; }
     XdgActivation& activation() const { return *m_activation; }
+    LayerShell& layerShell() const { return *m_layerShell; }
 
     // Where popups of `parent` must fit, in its window-geometry coordinates
     // (the desktop knows where things are; nullopt: unconstrained).
@@ -63,6 +68,13 @@ public:
     std::optional<Rect> popupBounds(const XdgSurface& parent) const
     {
         return popupBoundsProvider ? popupBoundsProvider(parent) : std::nullopt;
+    }
+
+    // The same for popups of non-xdg surfaces (layer shell), relative to its origin.
+    std::function<std::optional<Rect>(const Surface& parent)> surfacePopupBoundsProvider;
+    std::optional<Rect> surfacePopupBounds(const Surface& parent) const
+    {
+        return surfacePopupBoundsProvider ? surfacePopupBoundsProvider(parent) : std::nullopt;
     }
 
     Signal<Surface*> surfaceCreated;
@@ -75,12 +87,15 @@ private:
     std::unique_ptr<Global> m_compositor;
     std::unique_ptr<Global> m_subcompositor;
     std::unique_ptr<Global> m_xdgWmBase;
+    std::unique_ptr<Global> m_xdgDecorationManager;
+    std::unique_ptr<Global> m_xdgOutputManager;
     std::unique_ptr<LinuxDmabuf> m_dmabuf;
     std::unique_ptr<Seat> m_seat;
     std::unique_ptr<Global> m_dataDeviceManager;
     std::unique_ptr<Global> m_primarySelectionManager;
     std::unique_ptr<CursorShapeManager> m_cursorShapeManager;
     std::unique_ptr<XdgActivation> m_activation;
+    std::unique_ptr<LayerShell> m_layerShell;
     std::vector<std::pair<const wl_global*, std::function<bool(const wl_client*)>>> m_globalFilters;
     std::vector<std::unique_ptr<OutputGlobal>> m_outputs;
     Connection m_flush;
